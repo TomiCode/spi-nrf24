@@ -14,9 +14,9 @@
  * along with this program. If not, see <http://www.gnu.org/licenses/>.
  */
 
-#include <linux/module.h>
-#include <linux/kernel.h>
 #include <linux/init.h>
+#include <linux/module.h>
+#include <linux/device.h>
 
 #include <linux/spi/spi.h>
 
@@ -40,6 +40,7 @@ static int nrf24_major_num;
 static int nrf24_probe(struct spi_device *spi)
 {
   struct nrf24_radio *nrf24dev;
+  struct device *dev;
 
   nrf24dev = kmalloc(sizeof(*nrf24dev), GFP_KERNEL);
   if (!nrf24dev)
@@ -48,9 +49,8 @@ static int nrf24_probe(struct spi_device *spi)
   nrf24dev->spi = spi;
   nrf24dev->devt = MKDEV(nrf24_major_num, 0);
 
-  struct device *dev;
   
-  dev = device_create(nrf24_class, &nrf24dev->spi, nrf24dev->devt,
+  dev = device_create(nrf24_class, &spi->dev, nrf24dev->devt,
       nrf24dev, "radio-%d", spi->chip_select);
 
   if (PTR_ERR_OR_ZERO(dev) != 0) {
