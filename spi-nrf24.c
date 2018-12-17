@@ -21,7 +21,12 @@
 #include <linux/spi/spi.h>
 
 struct nrf24_radio {
+  dev_t devt;
   struct spi_device *spi;
+
+  struct gpio_desc *irq_gpiod;
+  struct gpio_desc *ce_gpiod;
+  struct gpio_desc *led_gpiod;
 };
 
 static const struct file_operations nrf24_fops = {
@@ -34,13 +39,41 @@ static int nrf24_major_num;
 
 static int nrf24_probe(struct spi_device *spi)
 {
-  printk(KERN_INFO "nrf24_probe called\n");
+  struct nrf24_radio *nrf24dev;
+
+  nrf24dev = kmalloc(sizeof(*nrf24dev), GFP_KERNEL);
+  if (!nrf24dev)
+    return -ENOMEM;
+
+  nrf24dev->spi = spi;
+  nrf24dev->devt = MKDEV(nrf24_major_num, 0);
+
+  struct device *dev;
+  
+  dev = device_create(nrf24_class, &nrf24dev->spi, nrf24dev->devt,
+      nrf24dev, "radio-%d", spi->chip_select);
+
+  if (PTR_ERR_OR_ZERO(dev) != 0) {
+    kfree(nrf24dev);
+    return -ENODEV;
+  }
+
+  spi_set_drvdata(spi, nrf24dev);
   return 0;
 }
 
 static int nrf24_remove(struct spi_device *spi)
 {
+  struct nrf24_radio *nrf24dev;
+
   printk(KERN_INFO "nrf24_remove called.\n");
+
+  nrf24dev = spi_get_drvdata(spi);
+  nrf24dev->spi = NULL;
+
+  device_destroy(nrf24_class, nrf24dev->devt);
+  kfree(nrf24dev);
+
   return 0;
 }
 
@@ -62,7 +95,8 @@ static struct spi_driver nrf24_spi_driver = {
 static int __init nrf24_init(void)
 {
   int status;
-  printk(KERN_INFO "Hello Agnieszka from nrf24 driver! ;)\n");
+
+  printk(KERN_INFO "Initialize nRF24 module.\n");
 
   status = register_chrdev(0, "nrf24", &nrf24_fops);
   if (status < 0)
