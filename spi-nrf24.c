@@ -27,7 +27,7 @@
 
 static int __init nrf24_init(void)
 {
-  printk(KERN_INFO "Hello world from nrf24 driver.");
+  printk(KERN_INFO "Hello world from nrf24 driver.\n");
 
   // Module successful registered.
   return 0;
@@ -35,7 +35,7 @@ static int __init nrf24_init(void)
 
 static void __exit nrf24_exit(void)
 {
-  printk(KERN_INFO "Module unloaded. Bye..");
+  printk(KERN_INFO "Module unloaded. Bye..\n");
 }
 
 module_init(nrf24_init);
