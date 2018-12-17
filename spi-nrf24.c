@@ -62,7 +62,7 @@ static struct spi_driver nrf24_spi_driver = {
 static int __init nrf24_init(void)
 {
   int status;
-  printk(KERN_INFO "Hello world from nrf24 driver.\n");
+  printk(KERN_INFO "Hello Agnieszka from nrf24 driver! ;)\n");
 
   status = register_chrdev(0, "nrf24", &nrf24_fops);
   if (status < 0)
