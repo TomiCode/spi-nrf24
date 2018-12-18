@@ -47,6 +47,10 @@
 struct nrf24_radio {
     dev_t devt;
     uint8_t in_use;
+
+    uint8_t status;
+    uint8_t config;
+
     struct spi_device *spi;
 
     struct gpio_desc *irq_gpiod;
@@ -59,6 +63,8 @@ struct nrf24_radio {
 static struct class *nrf24_class;
 
 static int nrf24_major_num;
+
+static unsigned int nrf24_minor_count;
 
 static ssize_t nrf24_read(struct file *file, char __user *buf,
         size_t count, loff_t *offset)
@@ -121,78 +127,116 @@ static const struct file_operations nrf24_fops = {
 
 static int nrf24_probe(struct spi_device *spi)
 {
-    struct nrf24_radio *nrf24dev;
+    struct nrf24_radio *rdev;
     struct device *dev;
     struct gpio_desc *gpio_d;
     size_t status;
 
-    nrf24dev = kmalloc(sizeof(*nrf24dev), GFP_KERNEL);
+    printk(KERN_DEBUG "Request nrf24_radio creation. Device probe.\n");
+
+    rdev = kmalloc(sizeof(*rdev), GFP_KERNEL);
     if (!nrf24dev)
         return -ENOMEM;
 
-    nrf24dev->spi = spi;
-    nrf24dev->devt = MKDEV(nrf24_major_num, 0);
+    rdev->spi = spi;
+    rdev->devt = MKDEV(nrf24_major_num, nrf24_minor_count);
 
-    /* GPIOs */
-    nrf24dev->led_gpiod = gpiod_get(&spi->dev, "led", GPIOD_OUT_LOW);
-    if (IS_ERR(nrf24dev->led_gpiod)) {
-        printk(KERN_WARNING "Can not require gpiod led %p.\n", nrf24dev->led_gpiod);
-        nrf24dev->led_gpiod = NULL;
-    }
-    else
-        gpiod_set_value(nrf24dev->led_gpiod, 1);
+    /* nRF24 gpio */
+    rdev->led_gpiod = gpiod_get_optional(&spi->dev, "led", GPIOD_OUT_LOW);
 
-    gpio_d = gpiod_get(&spi->dev, "ce", GPIOD_OUT_LOW);
-    if (IS_ERR(gpio_d)) {
-        printk(KERN_INFO "Unable to get led Device Tree node.\n");
-    }
-    else {
-        printk(KERN_INFO "Got device tree node.\n");
-        gpiod_put(gpio_d);
-    }
+    rdev->irq_gpiod = gpiod_get(&spi->dev, "interrupt", GPIOD_IN);
+    rdev->ce_gpiod  = gpiod_get(&spi->dev, "ce", GPIOD_OUT_LOW);
 
-    dev = device_create(nrf24_class, &spi->dev, nrf24dev->devt,
-            nrf24dev, "radio-%d", spi->chip_select);
+    if (IS_ERR(rdev->ce_gpiod) || IS_ERR(rdev->irq_gpiod)) {
+        if (rdev->led_gpiod)
+            gpiod_put(rdev->led_gpiod);
 
-    if (PTR_ERR_OR_ZERO(dev) != 0) {
-        kfree(nrf24dev);
-        return -ENODEV;
+        if (!IS_ERR(rdev->ce_gpiod))
+            gpiod_put(rdev->ce_gpiod);
+
+        if (!IS_ERR(rdev->irq_gpiod))
+            gpiod_put(rdev->irq_gpiod);
+
+        kfree(rdev);
+        return -EINVAL;
     }
 
-    spi_set_drvdata(spi, nrf24dev);
+    if (rdev->spi) {
+        struct device *dev;
+        size_t status;
 
-    status = spi_w8r8(spi, NRF24_REG_STATUS);
-    if (status < 0) {
-        printk(KERN_WARNING "Unable to query radio status.\n");
+        dev = device_create(nrf24_class, &spi->dev, rdev->devt, rdev,
+                "radio-%d", nrf24_minor_count++);
+
+        if (PTR_ERR_OR_ZERO(dev)) {
+            if (rdev->led_gpiod)
+                gpiod_put(rdev->led_gpiod);
+            gpiod_put(rdev->ce_gpiod);
+            gpiod_put(rdev->irq_gpiod);
+
+            kfree(rdev);
+            return -ENODEV;
+        }
+
+        status = spi_w8r8(spi, NRF24_REG_STATUS);
+        if (status < 0)
+            printk(KERN_WARNING "Unable to query STATUS register.\n");
+        rdev->status = (uint8_t)status;
+
+        status = spi_w8r8(spi, NRF24_REG_CONFIG);
+        if (status < 0)
+            printk(KERN_WARNING "Unable to query CONFIG register.\n");
+        rdev->config = (uint8_t)status;
     }
-    else {
-        printk(KERN_INFO "Radio current status: 0x%02x\n", status);
+
+    if (rdev->status != 0x07)
+        printk(KERN_WARNING "Status register unexpected value, got: %02x\n.", rdev->status);
+
+    if ((rdev->config & 0x02) == 0) {
+        uint8_t config = rdev->config;
+
+        // Set PWR_UP bit in config register
+        config = config & 0x02;
+
+        if (spi_write(spi, &config, sizeof(uint8_t)) == 0)
+            rdev->config = config;
     }
+
+    printk(KERN_DEBUG "spi radio device: config: %02x, status: %02x\n",
+            rdev->config, rdev->status);
+    spi_set_drvdata(spi, rdev);
 
     return 0;
 }
 
 static int nrf24_remove(struct spi_device *spi)
 {
-    struct nrf24_radio *nrf24dev;
+    struct nrf24_radio *rdev = spi_get_drvdata(spi);
 
-    printk(KERN_INFO "nrf24_remove called.\n");
+    printk(KERN_DEBUG "Destroy nrf24_radio structure. Device remove.\n");
 
-    nrf24dev = spi_get_drvdata(spi);
-    nrf24dev->spi = NULL;
+    if (rdev->config & 0x02) {
+        rdev->config &= ~0x02;
+        if (spi_write(spi, &rdev->config, sizeof(rdev->config)) < 0)
+            printk(KERN_WARNING "Unable to shutdown radio module!\n");
+    }
 
-    if (nrf24dev->led_gpiod)
-        gpiod_put(nrf24dev->led_gpiod);
+    if (rdev->led_gpiod)
+        gpiod_put(rdev->led_gpiod);
+    gpiod_put(rdev->irq_gpiod);
+    gpiod_put(rdev->ce_gpiod);
 
-    device_destroy(nrf24_class, nrf24dev->devt);
-    kfree(nrf24dev);
+    rdev->spi = NULL;
+
+    device_destroy(nrf24_class, rdev->devt);
+    kfree(rdev);
 
     return 0;
 }
 
 static void nrf24_shutdown(struct spi_device *spi)
 {
-
+    printk(KERN_DEBUG "Shutdown device called.\n");
 }
 
 static const struct of_device_id nrf24_of_ids[] = {
