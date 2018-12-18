@@ -53,12 +53,17 @@ struct nrf24_radio {
 
     struct spi_device *spi;
 
+    struct list_head device;
+
     struct gpio_desc *irq_gpiod;
     struct gpio_desc *ce_gpiod;
     struct gpio_desc *led_gpiod;
 
     uint8_t *mem_buf;
 };
+
+static DEFINE_MUTEX(nrf24_module_lock);
+static LIST_HEAD(nrf24_devices);
 
 static struct class *nrf24_class;
 
@@ -85,34 +90,61 @@ static long nrf24_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 
 static int nrf24_open(struct inode *inode, struct file *file)
 {
-    struct nrf24_radio *rdev = file->private_data;
+    struct nrf24_radio *rdev;
+    int status = -ENXIO;
 
-    if (rdev->in_use)
-        return -EBUSY;
+    mutex_lock(&nrf24_module_lock);
 
-    rdev->in_use++;
+    list_for_each_entry(rdev, nrf24_devices, device) {
+        if (rdev->devt == inode->i_rdev) {
+            status = 0;
+            break;
+        }
+    }
+
+    if (status == 0 && rdev->in_use)
+        status = -EBUSY;
+
+    if (status < 0) {
+        mutex_unlock(&nrf24_module_lock);
+        return status;
+    }
+
     rdev->mem_buf = kmalloc(sizeof(uint8_t) * NRF24_MAX_BUFFER, GFP_KERNEL);
     if (!rdev->mem_buf) {
-        rdev->in_use--;
+        mutex_unlock(&nrf24_module_lock);
         return -ENOMEM;
     }
+
+    rdev->in_use++;
+    file->private_data = rdev;
+
+    nonseekable_open(inode, file);
+    mutex_unlock(&nrf24_module_lock);
 
     return 0;
 }
 
 static int nrf24_release(struct inode *inode, struct file *file)
 {
-    struct nrf24_radio *rdev = file->private_data;
+    struct nrf24_radio *rdev;
 
-    if (rdev->in_use == 0) {
-       printk(KERN_WARNING "Release of an invalid nrf24_radio handler.");
-       return -EINVAL;
+    mutex_lock(&nrf24_module_lock);
+
+    rdev = file->private_data;
+    if (!rdev->in_use) {
+        mutex_unlock(&nrf24_module_lock);
+        printk(KERN_WANRNING "nrf24: Release of a unbound file node.");
+        return -EINVAL;
     }
 
-    kfree(rdev->mem_buf);
-    rdev->mem_buf = NULL;
+    if (rdev->mem_buf) {
+        kfree(rdev->mem_buf);
+        rdev->mem_buf = NULL;
+    }
     rdev->in_use--;
 
+    mutex_unlock(&nrf24_module_lock);
     return 0;
 }
 
@@ -134,12 +166,14 @@ static int nrf24_probe(struct spi_device *spi)
     if (!rdev)
         return -ENOMEM;
 
+    LIST_HEAD_INIT(&rdev->device);
     rdev->spi = spi;
     rdev->devt = MKDEV(nrf24_major_num, nrf24_minor_count);
 
+    mutex_lock(&nrf24_module_lock);
+
     /* nRF24 gpio */
     rdev->led_gpiod = gpiod_get_optional(&spi->dev, "led", GPIOD_OUT_LOW);
-
     rdev->irq_gpiod = gpiod_get(&spi->dev, "interrupt", GPIOD_IN);
     rdev->ce_gpiod  = gpiod_get(&spi->dev, "ce", GPIOD_OUT_LOW);
 
@@ -153,6 +187,7 @@ static int nrf24_probe(struct spi_device *spi)
         if (!IS_ERR(rdev->irq_gpiod))
             gpiod_put(rdev->irq_gpiod);
 
+        mutex_unlock(&nrf24_module_lock);
         kfree(rdev);
         return -EINVAL;
     }
@@ -170,6 +205,7 @@ static int nrf24_probe(struct spi_device *spi)
             gpiod_put(rdev->ce_gpiod);
             gpiod_put(rdev->irq_gpiod);
 
+            mutex_unlock(&nrf24_module_lock);
             kfree(rdev);
             return -ENODEV;
         }
@@ -189,33 +225,20 @@ static int nrf24_probe(struct spi_device *spi)
         printk(KERN_WARNING "Status register unexpected value, got: %02x.\n", rdev->status);
 
     if ((rdev->config & 0x02) == 0) {
-        uint16_t config = rdev->config;
+        uint16_t config = 0x20;
 
         // Set PWR_UP bit in config register
-        config = config & 0x02;
+        config = config | (rdev->config << 8);
 
         if (spi_write(spi, &config, sizeof(uint16_t)) == 0)
-            rdev->config = config;
+            rdev->config = (config >> 8);
     }
 
     printk(KERN_INFO "spi radio device: config: %02x, status: %02x\n",
             rdev->config, rdev->status);
+
     spi_set_drvdata(spi, rdev);
-
-    {
-        ssize_t config;
-        uint8_t cmd;
-        uint8_t test;
-
-        config = spi_w8r8(spi, 0);
-
-        cmd = 0x00;
-        if (spi_write_then_read(spi, &cmd, 1, &test, 1) < 0) {
-            printk(KERN_WARNING "write_then_read failed.\n");
-        }
-
-        printk(KERN_INFO "w8r8: %02x, write_then_read: %02x", config, test);
-    }
+    mutex_unlock(&nrf24_module_lock);
 
     return 0;
 }
