@@ -29,13 +29,45 @@ struct nrf24_radio {
   struct gpio_desc *led_gpiod;
 };
 
-static const struct file_operations nrf24_fops = {
-  .owner = THIS_MODULE,
-};
-
 static struct class *nrf24_class;
 
 static int nrf24_major_num;
+
+static ssize_t nrf24_read(struct file *file, char __user *buf,
+    size_t count, loff_t *offset)
+{
+  return 0;
+}
+
+static ssize_t nrf24_write(struct file *file, const char __user *buf, 
+    size_t count, loff_t *offset)
+{
+  return 0;
+}
+
+static long nrf24_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
+{
+  return 0;
+}
+
+
+static int nrf24_open(struct inode *inode, struct file *flip)
+{
+  return 0;
+}
+
+static int nrf24_release(struct inode *inode, struct file *flip)
+{
+  return 0;
+}
+
+static const struct file_operations nrf24_fops = {
+  .owner  = THIS_MODULE,
+  .read   = nrf24_read,
+  .write  = nrf24_write,
+  .open   = nrf24_open,
+  .release = nrf24_release,
+};
 
 static int nrf24_probe(struct spi_device *spi)
 {
@@ -49,7 +81,11 @@ static int nrf24_probe(struct spi_device *spi)
   nrf24dev->spi = spi;
   nrf24dev->devt = MKDEV(nrf24_major_num, 0);
 
+  /* GPIOs */
+  nrf24dev->led_gpiod = gpiod_get(&spi->dev, "nrf24,led", GPIOD_OUT_LOW);
   
+  gpiod_set_value(nrf24dev->led_gpiod, 1);
+
   dev = device_create(nrf24_class, &spi->dev, nrf24dev->devt,
       nrf24dev, "radio-%d", spi->chip_select);
 
@@ -70,6 +106,8 @@ static int nrf24_remove(struct spi_device *spi)
 
   nrf24dev = spi_get_drvdata(spi);
   nrf24dev->spi = NULL;
+
+  gpiod_put(nrf24dev->led_gpiod);
 
   device_destroy(nrf24_class, nrf24dev->devt);
   kfree(nrf24dev);
