@@ -20,6 +20,7 @@
 #include <linux/kernel.h>
 #include <linux/uaccess.h>
 #include <linux/spi/spi.h>
+#include <linux/gpio/consumer.h>
 
 #define NRF24_MAX_BUFFER 32
 
@@ -110,11 +111,12 @@ static int nrf24_release(struct inode *inode, struct file *file)
 }
 
 static const struct file_operations nrf24_fops = {
-    .owner  = THIS_MODULE,
-    .read   = nrf24_read,
-    .write  = nrf24_write,
-    .open   = nrf24_open,
-    .release = nrf24_release,
+    .owner          = THIS_MODULE,
+    .read           = nrf24_read,
+    .write          = nrf24_write,
+    .open           = nrf24_open,
+    .release        = nrf24_release,
+    .unlocked_ioctl = nrf24_ioctl,
 };
 
 static int nrf24_probe(struct spi_device *spi)
