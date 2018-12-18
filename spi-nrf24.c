@@ -159,7 +159,7 @@ static int nrf24_probe(struct spi_device *spi)
 
     if (rdev->spi) {
         struct device *dev;
-        size_t status;
+        ssize_t status;
 
         dev = device_create(nrf24_class, &spi->dev, rdev->devt, rdev,
                 "radio-%d", nrf24_minor_count++);
@@ -186,21 +186,36 @@ static int nrf24_probe(struct spi_device *spi)
     }
 
     if (rdev->status != 0x07)
-        printk(KERN_WARNING "Status register unexpected value, got: %02x\n.", rdev->status);
+        printk(KERN_WARNING "Status register unexpected value, got: %02x.\n", rdev->status);
 
     if ((rdev->config & 0x02) == 0) {
-        uint8_t config = rdev->config;
+        uint16_t config = rdev->config;
 
         // Set PWR_UP bit in config register
         config = config & 0x02;
 
-        if (spi_write(spi, &config, sizeof(uint8_t)) == 0)
+        if (spi_write(spi, &config, sizeof(uint16_t)) == 0)
             rdev->config = config;
     }
 
-    printk(KERN_DEBUG "spi radio device: config: %02x, status: %02x\n",
+    printk(KERN_INFO "spi radio device: config: %02x, status: %02x\n",
             rdev->config, rdev->status);
     spi_set_drvdata(spi, rdev);
+
+    {
+        ssize_t config;
+        uint8_t cmd;
+        uint8_t test;
+
+        config = spi_w8r8(spi, 0);
+
+        cmd = 0x00;
+        if (spi_write_then_read(spi, &cmd, 1, &test, 1) < 0) {
+            printk(KERN_WARNING "write_then_read failed.\n");
+        }
+
+        printk(KERN_INFO "w8r8: %02x, write_then_read: %02x", config, test);
+    }
 
     return 0;
 }
