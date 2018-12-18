@@ -123,6 +123,7 @@ static int nrf24_probe(struct spi_device *spi)
 {
     struct nrf24_radio *nrf24dev;
     struct device *dev;
+    struct gpio_desc *gpio_d;
     size_t status;
 
     nrf24dev = kmalloc(sizeof(*nrf24dev), GFP_KERNEL);
@@ -134,10 +135,23 @@ static int nrf24_probe(struct spi_device *spi)
 
     /* GPIOs */
     nrf24dev->led_gpiod = gpiod_get(&spi->dev, "nrf24,led", GPIOD_OUT_LOW);
+    if (IS_ERR(nrf24dev->led_gpiod)) {
+        printk(KERN_WARNING "Can not require gpiod led.\n");
+        nrf24dev->led_gpiod = NULL;
+    }
+    else
+        gpiod_set_value(nrf24dev->led_gpiod, 1);
 
-    gpiod_set_value(nrf24dev->led_gpiod, 1);
+    gpio_d = gpiod_get(&spi->dev, "led", GPIOD_OUT_LOW);
+    if (IS_ERR(gpio_d)) {
+        printk(KERN_INFO "Unable to get led Device Tree node.\n");
+    }
+    else {
+        printk(KERN_INFO "Got device tree node.\n");
+        gpiod_put(gpio_d);
+    }
 
-    dev = device_create(nrf24_class, &spi->dev, nrf24dev->devt, 
+    dev = device_create(nrf24_class, &spi->dev, nrf24dev->devt,
             nrf24dev, "radio-%d", spi->chip_select);
 
     if (PTR_ERR_OR_ZERO(dev) != 0) {
@@ -167,7 +181,8 @@ static int nrf24_remove(struct spi_device *spi)
     nrf24dev = spi_get_drvdata(spi);
     nrf24dev->spi = NULL;
 
-    gpiod_put(nrf24dev->led_gpiod);
+    if (nrf24dev->led_gpiod)
+        gpiod_put(nrf24dev->led_gpiod);
 
     device_destroy(nrf24_class, nrf24dev->devt);
     kfree(nrf24dev);
@@ -207,7 +222,7 @@ static int __init nrf24_init(void)
         return status;
 
     nrf24_major_num = status;
-  
+
     nrf24_class = class_create(THIS_MODULE, "nrf24radio");
     if (IS_ERR(nrf24_class)) {
         printk(KERN_WARNING "Unable to register nRF24 radio class.\n");
