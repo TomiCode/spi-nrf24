@@ -134,15 +134,15 @@ static int nrf24_probe(struct spi_device *spi)
     nrf24dev->devt = MKDEV(nrf24_major_num, 0);
 
     /* GPIOs */
-    nrf24dev->led_gpiod = gpiod_get(&spi->dev, "nrf24,led", GPIOD_OUT_LOW);
+    nrf24dev->led_gpiod = gpiod_get(&spi->dev, "led", GPIOD_OUT_LOW);
     if (IS_ERR(nrf24dev->led_gpiod)) {
-        printk(KERN_WARNING "Can not require gpiod led.\n");
+        printk(KERN_WARNING "Can not require gpiod led %p.\n", nrf24dev->led_gpiod);
         nrf24dev->led_gpiod = NULL;
     }
     else
         gpiod_set_value(nrf24dev->led_gpiod, 1);
 
-    gpio_d = gpiod_get(&spi->dev, "led", GPIOD_OUT_LOW);
+    gpio_d = gpiod_get(&spi->dev, "ce", GPIOD_OUT_LOW);
     if (IS_ERR(gpio_d)) {
         printk(KERN_INFO "Unable to get led Device Tree node.\n");
     }
