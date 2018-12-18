@@ -128,14 +128,10 @@ static const struct file_operations nrf24_fops = {
 static int nrf24_probe(struct spi_device *spi)
 {
     struct nrf24_radio *rdev;
-    struct device *dev;
-    struct gpio_desc *gpio_d;
-    size_t status;
 
     printk(KERN_DEBUG "Request nrf24_radio creation. Device probe.\n");
-
     rdev = kmalloc(sizeof(*rdev), GFP_KERNEL);
-    if (!nrf24dev)
+    if (!rdev)
         return -ENOMEM;
 
     rdev->spi = spi;
