@@ -74,17 +74,80 @@ static unsigned int nrf24_minor_count;
 static ssize_t nrf24_read(struct file *file, char __user *buf,
         size_t count, loff_t *offset)
 {
+    struct nrf24_radio *rdev = file->private_data;
+    size_t data_len;
+    int status;
+
+    if (*offset)
+        return -EINVAL;
+
+    if ((rdev->config & 0x01) == 0) {
+        printk(KERN_WARNING "nrf24: device not in rx mode.\n");
+        return -EIO;
+    }
+
+    status = spi_w8r8(rdev->spi, NRF24_REG_FIFO_STATUS);
+    if (status < 0) {
+        printk(KERN_WARNING "nrf24: unable to query FIFO_STATUS register.\n");
+        return status;
+    }
+
+    printk(KERN_DEBUG "nrf24: FIFO_STATUS: %02x\n", status);
+    if (status & 0x01)
+        return -ENODATA;
+
+    status = 0x61;
+    if (!spi_write_then_read(rdev->spi, &status, sizeof(uint8_t),
+                rdev->mem_buf, NRF24_MAX_BUFFER)) {
+        printk(KERN_WARNING "nrf24: spi io operation failed.\n");
+        return -EIO;
+    }
+
+    data_len = min_t(size_t, count, NRF24_MAX_BUFFER);
+    copy_to_user(buf, rdev->mem_buf, data_len);
+
     return 0;
 }
 
 static ssize_t nrf24_write(struct file *file, const char __user *buf,
         size_t count, loff_t *offset)
 {
-    return 0;
+    struct nrf24_radio *rdev = file->private_data;
+    int status;
+
+    if (*offset)
+        return -EINVAL;
+
+    if (count >= NRF24_MAX_BUFFER) {
+        printk(KERN_WARNING "nrf24: can not write more than %d bytes.\n", NRF24_MAX_BUFFER);
+        return -EINVAL;
+    }
+
+    if (rdev->config & 0x01) {
+        printk(KERN_WARNING "nrf24: write to a device in rx mode.\n");
+        return -EIO;
+    }
+
+    copy_from_user(rdev->mem_buf + 1, buf, count);
+    *(rdev->mem_buf) = 0x61;
+
+    // set CE pin for more than 10us
+    // rdev->ce_gpiod
+
+    if (spi_write(rdev->spi, rdev->mem_buf, count + 1)) {
+        printk(KERN_WARNING "nrf24: unable to write to spi bus.\n");
+        return -EIO;
+    }
+
+    return count;
 }
 
 static long nrf24_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 {
+    struct nrf24_radio *rdev = file->private_data;
+
+    printk(KERN_INFO "nrf24: ioctl command: %u, arg: %02x.\n", cmd, arg);
+
     return 0;
 }
 
