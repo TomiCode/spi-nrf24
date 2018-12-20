@@ -72,6 +72,20 @@ static int nrf24_major_num;
 
 static unsigned int nrf24_minor_count;
 
+static void nrf24_register_dump(struct spi_device *spi)
+{
+    uint8_t reg_value;
+
+    reg_value = spi_w8r8(spi, NRF24_REG_STATUS);
+    printk(KERN_DEBUG "-- nRF24 register debug --\nregister CONFIG: %02x\n", reg_value);
+
+    reg_value = spi_w8r8(spi, NRF24_REG_CONFIG);
+    printk(KERN_DEBUG "register CONFIG: %02x\n", reg_value);
+
+    reg_value = spi_w8r8(spi, NRF24_REG_FIFO_STATUS);
+    printk(KERN_DEBUG "register FIFO_STATUS: %02x\n", reg_value);
+}
+
 static ssize_t nrf24_read(struct file *file, char __user *buf,
         size_t count, loff_t *offset)
 {
@@ -81,6 +95,8 @@ static ssize_t nrf24_read(struct file *file, char __user *buf,
 
     printk(KERN_DEBUG "Read from nrf24 device, count: %d, offset: %lld.\n",
             count, *offset);
+
+    nrf24_register_dump(rdev->spi);
 
     if (*offset)
         return -EINVAL;
@@ -144,6 +160,8 @@ static ssize_t nrf24_write(struct file *file, const char __user *buf,
     gpiod_set_value(rdev->ce_gpiod, 1);
     udelay(12);
     gpiod_set_value(rdev->ce_gpiod, 0);
+
+    nrf24_register_dump(rdev->spi);
 
     return count;
 }
