@@ -43,6 +43,7 @@
 #define NRF24_REG_RX_ADDR_P5 0x0F
 #define NRF24_REG_TX_ADDR 0x10
 #define NRF24_REG_RX_PW_P0 0x11
+#define NRF24_REG_RX_PW_P1 0x12
 #define NRF24_REG_FIFO_STATUS 0x17
 
 struct nrf24_radio {
@@ -74,16 +75,37 @@ static unsigned int nrf24_minor_count;
 
 static void nrf24_register_dump(struct spi_device *spi)
 {
-    uint8_t reg_value;
+    uint8_t status, config;
+    uint8_t addr[5] = {0};
+    uint8_t s_ch1, s_ch2;
 
-    reg_value = spi_w8r8(spi, NRF24_REG_STATUS);
-    printk(KERN_DEBUG "-- nRF24 register debug --\nregister CONFIG: %02x\n", reg_value);
+    config = spi_w8r8(spi, NRF24_REG_CONFIG);
+    status = spi_w8r8(spi, NRF24_REG_STATUS);
+    printk(KERN_DEBUG "nRF24 registers\nCONFIG: %02x, STATUS: %02x\n",
+        config, status);
 
-    reg_value = spi_w8r8(spi, NRF24_REG_CONFIG);
-    printk(KERN_DEBUG "register CONFIG: %02x\n", reg_value);
+    status = spi_w8r8(spi, NRF24_REG_RF_CH);
+    config = spi_w8r8(spi, NRF24_REG_RF_SETUP);
+    printk(KERN_DEBUG "RF_SETUP: %02x, RF_CH: %02x\n", config, status);
 
-    reg_value = spi_w8r8(spi, NRF24_REG_FIFO_STATUS);
-    printk(KERN_DEBUG "register FIFO_STATUS: %02x\n", reg_value);
+    s_ch1 = spi_w8r8(spi, NRF24_REG_RX_PW_P0);
+    s_ch2 = spi_w8r8(spi, NRF24_REG_RX_PW_P1);
+    printk(KERN_DEBUG "RX_PW_P0: %02x, RX_PW_P1: %02x\n", s_ch1, s_ch2);
+
+    config = NRF24_REG_RX_ADDR_P0;
+    spi_write_then_read(spi, &config, 1, addr, 5);
+    printk(KERN_DEBUG "RX_ADDR_P0: %02x %02x %02x %02x %02x", addr[0],
+        addr[1], addr[2], addr[3], addr[4]);
+
+    config = NRF24_REG_RX_ADDR_P1;
+    spi_write_then_read(spi, &config, 1, addr, 5);
+    printk(KERN_DEBUG "RX_ADDR_P1: %02x %02x %02x %02x %02x", addr[0],
+        addr[1], addr[2], addr[3], addr[4]);
+
+    config = NRF24_REG_TX_ADDR;
+    spi_write_then_read(spi, &config, 1, addr, 5);
+    printk(KERN_DEBUG "TX_ADDR: %02x %02x %02x %02x %02x", addr[0],
+        addr[1], addr[2], addr[3], addr[4]);
 }
 
 static ssize_t nrf24_read(struct file *file, char __user *buf,
@@ -150,15 +172,30 @@ static ssize_t nrf24_write(struct file *file, const char __user *buf,
         return -EIO;
     }
 
+    rdev->status = spi_w8r8(rdev->spi, NRF24_REG_STATUS);
+    if (rdev->status < 0) {
+        printk(KERN_WARNING "nrf24: unable to query device status.\n");
+        rdev->status = 0;
+        return -EIO;
+    }
+
+    if (rdev->status & 0x10) {
+        uint16_t clear_bit = NRF24_REG_STATUS | 0x20;
+        clear_bit = (rdev->status & ~0x10) << 8;
+        spi_write(rdev->spi, &clear_bit, sizeof(uint16_t));
+        rdev->status = clear_bit >> 8;
+    }
+
     copy_from_user(rdev->mem_buf + 1, buf, count);
-    *(rdev->mem_buf) = 0x61;
+    *(rdev->mem_buf) = 0xA0;
 
     if (spi_write(rdev->spi, rdev->mem_buf, count + 1)) {
         printk(KERN_WARNING "nrf24: unable to write to spi bus.\n");
         return -EIO;
     }
+
     gpiod_set_value(rdev->ce_gpiod, 1);
-    udelay(12);
+    udelay(30);
     gpiod_set_value(rdev->ce_gpiod, 0);
 
     nrf24_register_dump(rdev->spi);
@@ -256,7 +293,7 @@ static int nrf24_probe(struct spi_device *spi)
     struct nrf24_radio *rdev;
 
     printk(KERN_DEBUG "Request nrf24_radio creation. Device probe.\n");
-    rdev = kmalloc(sizeof(*rdev), GFP_KERNEL);
+    rdev = kzalloc(sizeof(*rdev), GFP_KERNEL);
     if (!rdev)
         return -ENOMEM;
 
@@ -322,10 +359,21 @@ static int nrf24_probe(struct spi_device *spi)
         uint16_t config = 0x20;
 
         // Set PWR_UP bit in config register
-        config = config | (rdev->config << 8);
+        config |= (rdev->config | 0x02) << 8;
 
         if (spi_write(spi, &config, sizeof(uint16_t)) == 0)
-            rdev->config = (config >> 8);
+            rdev->config = config >> 8;
+    }
+
+    if (rdev->spi) {
+        uint16_t reg = 0x2032;
+        spi_write(spi, &reg, sizeof(uint16_t));
+
+        reg = 0x2031;
+        spi_write(spi, &reg, sizeof(uint16_t));
+
+        reg = 0x3425;
+        spi_write(spi, &reg, sizeof(uint16_t));
     }
 
     printk(KERN_INFO "spi radio device: config: %02x, status: %02x\n",
@@ -344,11 +392,13 @@ static int nrf24_remove(struct spi_device *spi)
 
     printk(KERN_DEBUG "Destroy nrf24_radio structure. Device remove.\n");
 
+    /*
     if (rdev->config & 0x02) {
         rdev->config &= ~0x02;
         if (spi_write(spi, &rdev->config, sizeof(rdev->config)) < 0)
             printk(KERN_WARNING "Unable to shutdown radio module!\n");
     }
+    */
 
     if (rdev->led_gpiod)
         gpiod_put(rdev->led_gpiod);
