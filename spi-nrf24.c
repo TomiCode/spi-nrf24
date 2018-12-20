@@ -15,6 +15,7 @@
  */
 
 #include <linux/init.h>
+#include <linux/delay.h>
 #include <linux/module.h>
 #include <linux/device.h>
 #include <linux/kernel.h>
@@ -78,6 +79,9 @@ static ssize_t nrf24_read(struct file *file, char __user *buf,
     size_t data_len;
     int status;
 
+    printk(KERN_DEBUG "Read from nrf24 device, count: %d, offset: %lld.\n",
+            count, *offset);
+
     if (*offset)
         return -EINVAL;
 
@@ -114,6 +118,9 @@ static ssize_t nrf24_write(struct file *file, const char __user *buf,
 {
     struct nrf24_radio *rdev = file->private_data;
 
+    printk(KERN_DEBUG "Write to nrf24 device, count: %d, offset: %lld.\n", 
+            count, *offset);
+
     if (*offset)
         return -EINVAL;
 
@@ -130,13 +137,13 @@ static ssize_t nrf24_write(struct file *file, const char __user *buf,
     copy_from_user(rdev->mem_buf + 1, buf, count);
     *(rdev->mem_buf) = 0x61;
 
-    // set CE pin for more than 10us
-    // rdev->ce_gpiod
-
     if (spi_write(rdev->spi, rdev->mem_buf, count + 1)) {
         printk(KERN_WARNING "nrf24: unable to write to spi bus.\n");
         return -EIO;
     }
+    gpiod_set_value(rdev->ce_gpiod, 1);
+    udelay(12);
+    gpiod_set_value(rdev->ce_gpiod, 0);
 
     return count;
 }
@@ -145,7 +152,7 @@ static long nrf24_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 {
     struct nrf24_radio *rdev = file->private_data;
     (void)rdev;
-    printk(KERN_INFO "nrf24: ioctl command: %u, arg: %02lx.\n", cmd, arg);
+    printk(KERN_DEBUG "nrf24: ioctl command: %u, arg: %02lx.\n", cmd, arg);
 
     return 0;
 }
@@ -155,6 +162,7 @@ static int nrf24_open(struct inode *inode, struct file *file)
     struct nrf24_radio *rdev;
     int status = -ENXIO;
 
+    printk(KERN_DEBUG "Open nrf24 device.\n");
     mutex_lock(&nrf24_module_lock);
 
     list_for_each_entry(rdev, &nrf24_devices, device) {
@@ -178,6 +186,9 @@ static int nrf24_open(struct inode *inode, struct file *file)
         return -ENOMEM;
     }
 
+    if (rdev->led_gpiod)
+        gpiod_set_value(rdev->led_gpiod, 1);
+
     rdev->in_use++;
     file->private_data = rdev;
 
@@ -191,6 +202,7 @@ static int nrf24_release(struct inode *inode, struct file *file)
 {
     struct nrf24_radio *rdev;
 
+    printk(KERN_DEBUG "Release a nrf24 device.\n");
     mutex_lock(&nrf24_module_lock);
 
     rdev = file->private_data;
@@ -204,6 +216,8 @@ static int nrf24_release(struct inode *inode, struct file *file)
         kfree(rdev->mem_buf);
         rdev->mem_buf = NULL;
     }
+    if (rdev->led_gpiod)
+        gpiod_set_value(rdev->led_gpiod, 0);
     rdev->in_use--;
 
     mutex_unlock(&nrf24_module_lock);
@@ -283,7 +297,7 @@ static int nrf24_probe(struct spi_device *spi)
         rdev->config = (uint8_t)status;
     }
 
-    if (rdev->status != 0x07)
+    if (rdev->status != 0x0e)
         printk(KERN_WARNING "Status register unexpected value, got: %02x.\n", rdev->status);
 
     if ((rdev->config & 0x02) == 0) {
@@ -298,6 +312,7 @@ static int nrf24_probe(struct spi_device *spi)
 
     printk(KERN_INFO "spi radio device: config: %02x, status: %02x\n",
             rdev->config, rdev->status);
+    list_add(&rdev->device, &nrf24_devices);
 
     spi_set_drvdata(spi, rdev);
     mutex_unlock(&nrf24_module_lock);
@@ -324,6 +339,7 @@ static int nrf24_remove(struct spi_device *spi)
 
     rdev->spi = NULL;
 
+    list_del(&rdev->device);
     device_destroy(nrf24_class, rdev->devt);
     kfree(rdev);
 
