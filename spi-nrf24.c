@@ -113,7 +113,6 @@ static ssize_t nrf24_write(struct file *file, const char __user *buf,
         size_t count, loff_t *offset)
 {
     struct nrf24_radio *rdev = file->private_data;
-    int status;
 
     if (*offset)
         return -EINVAL;
@@ -145,8 +144,8 @@ static ssize_t nrf24_write(struct file *file, const char __user *buf,
 static long nrf24_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 {
     struct nrf24_radio *rdev = file->private_data;
-
-    printk(KERN_INFO "nrf24: ioctl command: %u, arg: %02x.\n", cmd, arg);
+    (void)rdev;
+    printk(KERN_INFO "nrf24: ioctl command: %u, arg: %02lx.\n", cmd, arg);
 
     return 0;
 }
@@ -158,7 +157,7 @@ static int nrf24_open(struct inode *inode, struct file *file)
 
     mutex_lock(&nrf24_module_lock);
 
-    list_for_each_entry(rdev, nrf24_devices, device) {
+    list_for_each_entry(rdev, &nrf24_devices, device) {
         if (rdev->devt == inode->i_rdev) {
             status = 0;
             break;
@@ -197,7 +196,7 @@ static int nrf24_release(struct inode *inode, struct file *file)
     rdev = file->private_data;
     if (!rdev->in_use) {
         mutex_unlock(&nrf24_module_lock);
-        printk(KERN_WANRNING "nrf24: Release of a unbound file node.");
+        printk(KERN_WARNING "nrf24: Release of a unbound file node.");
         return -EINVAL;
     }
 
@@ -229,7 +228,7 @@ static int nrf24_probe(struct spi_device *spi)
     if (!rdev)
         return -ENOMEM;
 
-    LIST_HEAD_INIT(&rdev->device);
+    INIT_LIST_HEAD(&rdev->device);
     rdev->spi = spi;
     rdev->devt = MKDEV(nrf24_major_num, nrf24_minor_count);
 
