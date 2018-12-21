@@ -108,6 +108,38 @@ static void nrf24_register_dump(struct spi_device *spi)
         addr[1], addr[2], addr[3], addr[4]);
 }
 
+static int nrf24_reg_write(struct spi_device *spi, uint8_t r_addr, uint8_t val)
+{
+    uint16_t local_buf;
+    struct spi_transfer t = {
+        .tx_buf = &local_buf,
+        .len = sizeof(uint16_t),
+    };
+
+    spi_data = 0x20 | (r_addr & 0x1f) | (val << 8);
+    return spi_sync_transfer(spi, &t, 1);
+}
+
+static int nrf24_reg_read(struct spi_device *spi, uint8_t r_addr, uint8_t *pval)
+{
+    struct spi_transfer t[2] = {
+        { .tx_buf = &r_addr,    .len = sizeof(uint8_t) },
+        { .rx_buf = pval,       .len = sizeof(uint8_t) },
+    };
+
+    return spi_sync_transfer(spi, t, 2);
+}
+
+static int nrf24_send_cmd(struct spi_device *spi, uint8_t cmd)
+{
+    struct spi_transfer t = {
+        .tx_buf = &cmd,
+        .len = sizeof(uint8_t),
+    };
+
+    return spi_sync_transfer(spi, &t, 1);
+}
+
 static ssize_t nrf24_read(struct file *file, char __user *buf,
         size_t count, loff_t *offset)
 {
@@ -156,7 +188,7 @@ static ssize_t nrf24_write(struct file *file, const char __user *buf,
 {
     struct nrf24_radio *rdev = file->private_data;
 
-    printk(KERN_DEBUG "Write to nrf24 device, count: %d, offset: %lld.\n", 
+    printk(KERN_DEBUG "Write to nrf24 device, count: %d, offset: %lld.\n",
             count, *offset);
 
     if (*offset)
@@ -287,6 +319,17 @@ static const struct file_operations nrf24_fops = {
     .release        = nrf24_release,
     .unlocked_ioctl = nrf24_ioctl,
 };
+
+static int nrf24_powerup(struct nrf24_radio *rdev)
+{
+    if (nrf24_reg_read(rdev->spi, NRF24_REG_CONFIG, &rdev->config))
+        return -EINVAL;
+
+    if (nrf24_reg_read(rdev->spi, NRF24_REG_STATUS, &rdev->status))
+        return -EINVAL;
+
+
+}
 
 static int nrf24_probe(struct spi_device *spi)
 {
