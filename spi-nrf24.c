@@ -175,11 +175,11 @@ static int nrf24_cmd(struct spi_device *spi, uint8_t cmd)
 
 static int nrf24_disable_rx_mode(struct nrf24_radio *rdev)
 {
-    if (rdev->status & 0x01) {
+    if (rdev->config & 0x01) {
         int ret;
 
-        rdev->status &= ~0x01;
-        ret = nrf24_write_then_read_reg(rdev->spi, NRF24_REG_CONFIG, &rdev->status);
+        rdev->config &= ~0x01;
+        ret = nrf24_write_then_read_reg(rdev->spi, NRF24_REG_CONFIG, &rdev->config);
         if (ret < 0)
             return ret;
     }
@@ -190,11 +190,11 @@ static int nrf24_disable_rx_mode(struct nrf24_radio *rdev)
 
 static int nrf24_rx_mode(struct nrf24_radio *rdev)
 {
-    if ((rdev->status & 0x01) == 0) {
+    if ((rdev->config & 0x01) == 0) {
         int ret;
 
-        rdev->status |= 0x01;
-        ret = nrf24_write_then_read_reg(rdev->spi, NRF24_REG_CONFIG, &rdev->status);
+        rdev->config |= 0x01;
+        ret = nrf24_write_then_read_reg(rdev->spi, NRF24_REG_CONFIG, &rdev->config);
         if (ret < 0)
             return ret;
     }
