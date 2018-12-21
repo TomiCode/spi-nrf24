@@ -50,8 +50,9 @@ struct nrf24_radio {
     dev_t devt;
     uint8_t in_use;
 
-    uint8_t status;
     uint8_t config;
+    uint8_t status;
+    uint8_t fifo_status;
 
     struct spi_device *spi;
 
@@ -108,40 +109,103 @@ static void nrf24_register_dump(struct spi_device *spi)
         addr[1], addr[2], addr[3], addr[4]);
 }
 
-static int nrf24_reg_write(struct spi_device *spi, uint8_t r_addr, uint8_t val)
+static int nrf24_write_reg(struct spi_device *spi, uint8_t addr, uint8_t val)
 {
-    uint16_t local_buf;
+    uint16_t spi_buf;
     struct spi_transfer t = {
-        .tx_buf = &local_buf,
-        .len = sizeof(uint16_t),
+        .tx_buf = &spi_buf,
+        .len    = sizeof(uint16_t) },
     };
 
-    spi_data = 0x20 | (r_addr & 0x1f) | (val << 8);
-    return spi_sync_transfer(spi, &t, 1);
+    spi_buf = 0x20 | (addr & 0x1f) | (val << 8);
+    return spi_sync_transfer(spi, t, 1);
 }
 
-static int nrf24_reg_read(struct spi_device *spi, uint8_t r_addr, uint8_t *pval)
+static int nrf24_read_reg(struct spi_device *spi, uint8_t addr, uint8_t *val)
 {
     struct spi_transfer t[2] = {
-        { .tx_buf = &r_addr,    .len = sizeof(uint8_t) },
-        { .rx_buf = pval,       .len = sizeof(uint8_t) },
+        { .tx_buf = &addr,  .len = sizeof(uint8_t) },
+        { .rx_buf = val,    .len = sizeof(uint8_t) },
     };
 
     return spi_sync_transfer(spi, t, 2);
 }
 
-static int nrf24_send_cmd(struct spi_device *spi, uint8_t cmd)
+static int nrf24_write_then_read_reg(struct spi_device *spi, uint8_t addr, uint8_t *val)
+{
+    uint16_t spi_buf;
+    int ret;
+
+    struct spi_transfer t[2] = {
+        { .tx_buf = &spi_buf,   .len = sizeof(uint16_t) },
+        { .rx_buf = val,        .len = sizeof(uint8_t) },
+    };
+
+    spi_buf = 0x20 | (addr & 0x1f) | (*val << 8);
+    ret = spi_sync_transfer(spi, t, 1);
+    if (ret < 0)
+        return ret;
+
+    *t = { .tx_buf = &addr, .len = sizeof(uint8_t) };
+    return spi_sync_transfer(spi, t, 2);
+}
+
+static inline int nrf24_query_status(struct nrf24_radio *rdev)
+{
+    int ret;
+
+    ret = nrf24_read_reg(rdev->spi, NRF24_REG_STATUS, &rdev->status);
+    if (ret < 0)
+        return ret;
+
+    return nrf24_read_reg(rdev->spi, NRF24_REG_FIFO_STATUS, &rdev->fifo_status);
+}
+
+
+static int nrf24_cmd(struct spi_device *spi, uint8_t cmd)
 {
     struct spi_transfer t = {
         .tx_buf = &cmd,
-        .len = sizeof(uint8_t),
+        .len    = sizeof(uint8_t),
     };
 
     return spi_sync_transfer(spi, &t, 1);
 }
 
-static ssize_t nrf24_read(struct file *file, char __user *buf,
-        size_t count, loff_t *offset)
+static int nrf24_standby_mode(struct nrf24_radio *rdev)
+{
+    int ret;
+
+    if ((rdev->status & 0x01) == 0)
+        return -EINVAL;
+
+    rdev->status &= ~0x01;
+    ret = nrf24_write_then_read_reg(rdev->spi, NRF24_REG_CONFIG, &rdev->status);
+    if (ret < 0)
+        return ret;
+
+    gpiod_set_value(rdev->ce_gpiod, 0);
+    return 0;
+}
+
+static int nrf24_rx_mode(struct nrf24_radio *rdev)
+{
+    int ret;
+
+    if ((rdev->status & 0x01) == 0) {
+        rdev->status |= 0x01;
+        ret = nrf24_write_then_read_reg(rdev->spi, NRF24_REG_CONFIG, &rdev->status);
+        if (ret < 0)
+            return ret;
+    }
+
+    gpiod_set_value(rdev->ce_gpiod, 1);
+    udelay(130);
+
+    return 0;
+}
+
+static ssize_t nrf24_read(struct file *file, char __user *buf, size_t count, loff_t *offset)
 {
     struct nrf24_radio *rdev = file->private_data;
     size_t data_len;
@@ -183,8 +247,8 @@ static ssize_t nrf24_read(struct file *file, char __user *buf,
     return 0;
 }
 
-static ssize_t nrf24_write(struct file *file, const char __user *buf,
-        size_t count, loff_t *offset)
+static ssize_t nrf24_write(struct file *file, const char __user *buf, size_t count,
+        loff_t *offset)
 {
     struct nrf24_radio *rdev = file->private_data;
 
@@ -194,7 +258,7 @@ static ssize_t nrf24_write(struct file *file, const char __user *buf,
     if (*offset)
         return -EINVAL;
 
-    if (count >= NRF24_MAX_BUFFER) {
+    if (count > NRF24_MAX_BUFFER) {
         printk(KERN_WARNING "nrf24: can not write more than %d bytes.\n", NRF24_MAX_BUFFER);
         return -EINVAL;
     }
@@ -244,12 +308,54 @@ static long nrf24_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
     return 0;
 }
 
+/*
+ * Reset configuration register within the module,
+ * check rx/tx fifo status and (if neccessary) clear the fifos.
+ * Enable module (PWR_UP) and set to PRIM_RX mode.
+ */
+static int nrf24_device_setup(struct nrf24_radio *rdev)
+{
+    int ret;
+
+    rdev->config = 0x08;
+    ret = nrf24_write_then_read_reg(rdev->spi, NRF24_REG_CONFIG, &rdev->config);
+    if (ret < 0)
+        return ret;
+
+    ret = nrf24_query_status(rdev);
+    if (ret < 0)
+        return ret;
+
+    if (rdev->status & 0x10) {
+        if (rdev->fifo_status != 0x11) {
+            nrf24_cmd(rdev->spi, 0xe1);
+            nrf24_cmd(rdev->spi, 0xe2);
+        }
+
+        nrf24_write_reg(rdev->spi, NRF24_REG_STATUS, rdev->status & ~0x10);
+    }
+
+    ret = nrf24_query_status(rdev);
+    if (ret < 0)
+        return ret;
+
+    // MASK_TX_DS | MASK_MAX_RT | PWR_UP
+    rdev->config |= 0x32;
+    ret = nrf24_write_then_read_reg(rdev->spi, NRF24_REG_CONFIG, &rdev->config);
+    if (ret < 0)
+        return ret;
+
+    printk(KERN_DEBUG "nrf24: device status %02x\n", rdev->status);
+    return nrf24_rx_mode(rdev);
+}
+
 static int nrf24_open(struct inode *inode, struct file *file)
 {
+    uint8_t r_status, r_config, r_fifo_status;
     struct nrf24_radio *rdev;
     int status = -ENXIO;
 
-    printk(KERN_DEBUG "Open nrf24 device.\n");
+    printk(KERN_DEBUG "nrf24: device open.\n");
     mutex_lock(&nrf24_module_lock);
 
     list_for_each_entry(rdev, &nrf24_devices, device) {
@@ -267,14 +373,18 @@ static int nrf24_open(struct inode *inode, struct file *file)
         return status;
     }
 
-    rdev->mem_buf = kmalloc(sizeof(uint8_t) * NRF24_MAX_BUFFER, GFP_KERNEL);
+    rdev->mem_buf = kmalloc(sizeof(uint8_t) * (NRF24_MAX_BUFFER + 1), GFP_KERNEL);
     if (!rdev->mem_buf) {
         mutex_unlock(&nrf24_module_lock);
         return -ENOMEM;
     }
 
-    if (rdev->led_gpiod)
-        gpiod_set_value(rdev->led_gpiod, 1);
+    status = nrf24_device_setup(rdev);
+    if (status < 0) {
+        kfree(rdev->mem_buf);
+        mutex_unlock(&nrf24_module_lock);
+        return status;
+    }
 
     rdev->in_use++;
     file->private_data = rdev;
@@ -320,22 +430,13 @@ static const struct file_operations nrf24_fops = {
     .unlocked_ioctl = nrf24_ioctl,
 };
 
-static int nrf24_powerup(struct nrf24_radio *rdev)
-{
-    if (nrf24_reg_read(rdev->spi, NRF24_REG_CONFIG, &rdev->config))
-        return -EINVAL;
-
-    if (nrf24_reg_read(rdev->spi, NRF24_REG_STATUS, &rdev->status))
-        return -EINVAL;
-
-
-}
-
 static int nrf24_probe(struct spi_device *spi)
 {
     struct nrf24_radio *rdev;
 
     printk(KERN_DEBUG "Request nrf24_radio creation. Device probe.\n");
+    mutex_lock(&nrf24_module_lock);
+
     rdev = kzalloc(sizeof(*rdev), GFP_KERNEL);
     if (!rdev)
         return -ENOMEM;
@@ -343,8 +444,6 @@ static int nrf24_probe(struct spi_device *spi)
     INIT_LIST_HEAD(&rdev->device);
     rdev->spi = spi;
     rdev->devt = MKDEV(nrf24_major_num, nrf24_minor_count);
-
-    mutex_lock(&nrf24_module_lock);
 
     /* nRF24 gpio */
     rdev->led_gpiod = gpiod_get_optional(&spi->dev, "led", GPIOD_OUT_LOW);
@@ -354,10 +453,8 @@ static int nrf24_probe(struct spi_device *spi)
     if (IS_ERR(rdev->ce_gpiod) || IS_ERR(rdev->irq_gpiod)) {
         if (rdev->led_gpiod)
             gpiod_put(rdev->led_gpiod);
-
         if (!IS_ERR(rdev->ce_gpiod))
             gpiod_put(rdev->ce_gpiod);
-
         if (!IS_ERR(rdev->irq_gpiod))
             gpiod_put(rdev->irq_gpiod);
 
@@ -368,7 +465,6 @@ static int nrf24_probe(struct spi_device *spi)
 
     if (rdev->spi) {
         struct device *dev;
-        ssize_t status;
 
         dev = device_create(nrf24_class, &spi->dev, rdev->devt, rdev,
                 "radio-%d", nrf24_minor_count++);
@@ -383,46 +479,9 @@ static int nrf24_probe(struct spi_device *spi)
             kfree(rdev);
             return -ENODEV;
         }
-
-        status = spi_w8r8(spi, NRF24_REG_STATUS);
-        if (status < 0)
-            printk(KERN_WARNING "Unable to query STATUS register.\n");
-        rdev->status = (uint8_t)status;
-
-        status = spi_w8r8(spi, NRF24_REG_CONFIG);
-        if (status < 0)
-            printk(KERN_WARNING "Unable to query CONFIG register.\n");
-        rdev->config = (uint8_t)status;
     }
 
-    if (rdev->status != 0x0e)
-        printk(KERN_WARNING "Status register unexpected value, got: %02x.\n", rdev->status);
-
-    if ((rdev->config & 0x02) == 0) {
-        uint16_t config = 0x20;
-
-        // Set PWR_UP bit in config register
-        config |= (rdev->config | 0x02) << 8;
-
-        if (spi_write(spi, &config, sizeof(uint16_t)) == 0)
-            rdev->config = config >> 8;
-    }
-
-    if (rdev->spi) {
-        uint16_t reg = 0x2032;
-        spi_write(spi, &reg, sizeof(uint16_t));
-
-        reg = 0x2031;
-        spi_write(spi, &reg, sizeof(uint16_t));
-
-        reg = 0x3425;
-        spi_write(spi, &reg, sizeof(uint16_t));
-    }
-
-    printk(KERN_INFO "spi radio device: config: %02x, status: %02x\n",
-            rdev->config, rdev->status);
     list_add(&rdev->device, &nrf24_devices);
-
     spi_set_drvdata(spi, rdev);
     mutex_unlock(&nrf24_module_lock);
 
@@ -433,15 +492,7 @@ static int nrf24_remove(struct spi_device *spi)
 {
     struct nrf24_radio *rdev = spi_get_drvdata(spi);
 
-    printk(KERN_DEBUG "Destroy nrf24_radio structure. Device remove.\n");
-
-    /*
-    if (rdev->config & 0x02) {
-        rdev->config &= ~0x02;
-        if (spi_write(spi, &rdev->config, sizeof(rdev->config)) < 0)
-            printk(KERN_WARNING "Unable to shutdown radio module!\n");
-    }
-    */
+    printk(KERN_WARNING "Destroy nrf24_radio structure. Device remove.\n");
 
     if (rdev->led_gpiod)
         gpiod_put(rdev->led_gpiod);
@@ -459,12 +510,12 @@ static int nrf24_remove(struct spi_device *spi)
 
 static void nrf24_shutdown(struct spi_device *spi)
 {
-    printk(KERN_DEBUG "Shutdown device called.\n");
+    printk(KERN_WARNING "Shutdown device called.\n");
 }
 
 static const struct of_device_id nrf24_of_ids[] = {
     { .compatible = "nordicsemi,nrf24l01p" },
-    {},
+    { },
 };
 MODULE_DEVICE_TABLE(of, nrf24_of_ids);
 
