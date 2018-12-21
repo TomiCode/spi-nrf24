@@ -114,11 +114,11 @@ static int nrf24_write_reg(struct spi_device *spi, uint8_t addr, uint8_t val)
     uint16_t spi_buf;
     struct spi_transfer t = {
         .tx_buf = &spi_buf,
-        .len    = sizeof(uint16_t) },
+        .len    = sizeof(uint16_t),
     };
 
     spi_buf = 0x20 | (addr & 0x1f) | (val << 8);
-    return spi_sync_transfer(spi, t, 1);
+    return spi_sync_transfer(spi, &t, 1);
 }
 
 static int nrf24_read_reg(struct spi_device *spi, uint8_t addr, uint8_t *val)
@@ -146,7 +146,8 @@ static int nrf24_write_then_read_reg(struct spi_device *spi, uint8_t addr, uint8
     if (ret < 0)
         return ret;
 
-    *t = { .tx_buf = &addr, .len = sizeof(uint8_t) };
+    t[0].tx_buf = &addr;
+    t[0].len    = sizeof(uint8_t);
     return spi_sync_transfer(spi, t, 2);
 }
 
@@ -351,7 +352,6 @@ static int nrf24_device_setup(struct nrf24_radio *rdev)
 
 static int nrf24_open(struct inode *inode, struct file *file)
 {
-    uint8_t r_status, r_config, r_fifo_status;
     struct nrf24_radio *rdev;
     int status = -ENXIO;
 
