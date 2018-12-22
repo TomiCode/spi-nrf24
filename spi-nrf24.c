@@ -25,27 +25,60 @@
 
 #define NRF24_MAX_BUFFER 32
 
-#define NRF24_REG_CONFIG 0x00
-#define NRF24_REG_EN_AA 0x01
-#define NRF24_REG_EN_RXADDR 0x02
-#define NRF24_REG_SETUP_AW 0x03
-#define NRF24_REG_SETUP_RETR 0x04
-#define NRF24_REG_RF_CH 0x05
-#define NRF24_REG_RF_SETUP 0x06
-#define NRF24_REG_STATUS 0x07
-#define NRF24_REG_OBSERVE_TX 0x08
-#define NRF24_REG_RPD 0x09
-#define NRF24_REG_RX_ADDR_P0 0x0A
-#define NRF24_REG_RX_ADDR_P1 0x0B
-#define NRF24_REG_RX_ADDR_P2 0x0C
-#define NRF24_REG_RX_ADDR_P3 0x0D
-#define NRF24_REG_RX_ADDR_P4 0x0E
-#define NRF24_REG_RX_ADDR_P5 0x0F
-#define NRF24_REG_TX_ADDR 0x10
-#define NRF24_REG_RX_PW_P0 0x11
-#define NRF24_REG_RX_PW_P1 0x12
-#define NRF24_REG_FIFO_STATUS 0x17
+/*
+ * Module internal register addresses.
+ */
+#define NRF24_REG_CONFIG        0x00
+#define NRF24_REG_EN_AA         0x01
+#define NRF24_REG_EN_RXADDR     0x02
+#define NRF24_REG_SETUP_AW      0x03
+#define NRF24_REG_SETUP_RETR    0x04
+#define NRF24_REG_RF_CH         0x05
+#define NRF24_REG_RF_SETUP      0x06
+#define NRF24_REG_STATUS        0x07
+#define NRF24_REG_OBSERVE_TX    0x08
+#define NRF24_REG_RPD           0x09
+#define NRF24_REG_RX_ADDR_P0    0x0A
+#define NRF24_REG_RX_ADDR_P1    0x0B
+#define NRF24_REG_RX_ADDR_P2    0x0C
+#define NRF24_REG_RX_ADDR_P3    0x0D
+#define NRF24_REG_RX_ADDR_P4    0x0E
+#define NRF24_REG_RX_ADDR_P5    0x0F
+#define NRF24_REG_TX_ADDR       0x10
+#define NRF24_REG_RX_PW_P0      0x11
+#define NRF24_REG_RX_PW_P1      0x12
+#define NRF24_REG_FIFO_STATUS   0x17
 
+/*
+ * Device driver internal rx/tx buffer with the related command.
+ */
+struct nrf24_dev_buf {
+    uint8_t cmd;
+    uint8_t buf[NRF24_MAX_BUFFER];
+};
+
+/*
+ * Device required gpio descriptors.
+ */
+struct nrf24_dev_gpios {
+    struct gpio_desc *led;
+    struct gpio_desc *irq;
+    struct gpio_desc *ce;
+};
+
+struct nrf24_dev {
+    uint8_t attrs;
+    uint8_t devid;
+    spinlock_t bus_lock;
+
+    struct spi_device *spi;
+    struct list_head device;
+
+    struct nrf24_dev_gpios *gpio;
+    struct nrf24_dev_buf *buf;
+};
+
+/*
 struct nrf24_radio {
     dev_t devt;
     uint8_t in_use;
@@ -62,17 +95,17 @@ struct nrf24_radio {
     struct gpio_desc *ce_gpiod;
     struct gpio_desc *led_gpiod;
 
-    uint8_t *mem_buf;
+    struct nrf24_radio_buffer *buf;
 };
+*/
 
 static DEFINE_MUTEX(nrf24_module_lock);
+
+static DECLARE_BITMAP(nrf24_nodes);
 static LIST_HEAD(nrf24_devices);
 
 static struct class *nrf24_class;
-
-static int nrf24_major_num;
-
-static unsigned int nrf24_minor_count;
+static int nrf24_major;
 
 static void nrf24_register_dump(struct spi_device *spi)
 {
@@ -151,6 +184,16 @@ static int nrf24_write_then_read_reg(struct spi_device *spi, uint8_t addr, uint8
     return spi_sync_transfer(spi, t, 2);
 }
 
+static int nrf24_cmd(struct spi_device *spi, uint8_t cmd)
+{
+    struct spi_transfer t = {
+        .tx_buf = &cmd,
+        .len    = sizeof(uint8_t),
+    };
+
+    return spi_sync_transfer(spi, &t, 1);
+}
+
 static inline int nrf24_query_status(struct nrf24_radio *rdev)
 {
     int ret;
@@ -160,17 +203,6 @@ static inline int nrf24_query_status(struct nrf24_radio *rdev)
         return ret;
 
     return nrf24_read_reg(rdev->spi, NRF24_REG_FIFO_STATUS, &rdev->fifo_status);
-}
-
-
-static int nrf24_cmd(struct spi_device *spi, uint8_t cmd)
-{
-    struct spi_transfer t = {
-        .tx_buf = &cmd,
-        .len    = sizeof(uint8_t),
-    };
-
-    return spi_sync_transfer(spi, &t, 1);
 }
 
 static int nrf24_disable_rx_mode(struct nrf24_radio *rdev)
@@ -422,7 +454,7 @@ static const struct file_operations nrf24_fops = {
     .unlocked_ioctl = nrf24_ioctl,
 };
 
-static inline void nrf24_gpio_unregister(nrf24_radio *rdev)
+static inline void nrf24_gpio_unregister(struct nrf24_radio *rdev)
 {
     if (rdev->led_gpiod) {
         gpiod_set_value(rdev->led_gpiod, 0);
