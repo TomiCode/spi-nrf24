@@ -23,7 +23,6 @@
 #include <linux/spi/spi.h>
 #include <linux/gpio/consumer.h>
 
-#define NRF24_MAX_BUFFER 32
 
 /*
  * Module internal register addresses.
@@ -50,11 +49,17 @@
 #define NRF24_REG_FIFO_STATUS   0x17
 
 /*
+ * Device driver constraints.
+ */
+#define NRF24_BUFFER_SIZE 32
+#define NRF24_MAX_NODES 8
+
+/*
  * Device driver internal rx/tx buffer with the related command.
  */
 struct nrf24_dev_buf {
     uint8_t cmd;
-    uint8_t buf[NRF24_MAX_BUFFER];
+    uint8_t buf[NRF24_BUFFER_SIZE];
 };
 
 /*
@@ -68,7 +73,7 @@ struct nrf24_dev_gpios {
 
 struct nrf24_dev {
     uint8_t attrs;
-    uint8_t devid;
+    uint8_t node_id;
     spinlock_t bus_lock;
 
     struct spi_device *spi;
@@ -454,21 +459,51 @@ static const struct file_operations nrf24_fops = {
     .unlocked_ioctl = nrf24_ioctl,
 };
 
-static inline void nrf24_gpio_unregister(struct nrf24_radio *rdev)
+static void nrf24_gpio_destroy(struct nrf24_dev *rdev)
 {
-    if (rdev->led_gpiod) {
-        gpiod_set_value(rdev->led_gpiod, 0);
-        gpiod_put(rdev->led_gpiod);
+    struct nrf24_dev_gpios *gpios = rdev->gpio;
+
+    if (gpios->led)
+        gpiod_put(gpios->led);
+
+    gpiod_put(gpios->ce);
+    gpiod_put(gpios->irq);
+
+    kfree(gpios);
+    rdev->gpio = NULL;
+}
+
+static int nrf24_gpio_create(struct nrf24_dev *rdev)
+{
+    struct nrf24_dev_gpios *gpios;
+
+    gpios = kzalloc(sizeof(*rdev->gpio), GFP_KERNEL);
+    if (!gpios)
+        return -ENOMEM;
+
+    gpios->irq = gpiod_get(&rdev->spi->dev, "interrupt", GPIOD_IN);
+    if (IS_ERR(gpios->irq)) {
+        kfree(gpios);
+        return -EIO;
     }
-    gpiod_set_value(rdev->ce_gpiod, 0);
-    gpiod_put(rdev->ce_gpiod);
-    gpiod_put(rdev->irq_gpiod);
+
+    gpios->ce = gpiod_get(&rdev->spi->dev, "ce", GPIOD_OUT_LOW);
+    if (IS_ERR(gpios->ce)) {
+        gpiod_put(gpios->irq);
+        kfree(gpios);
+        return -EIO;
+    }
+
+    gpios->led = gpiod_get_optional(&rdev->spi->dev, "led", GPIOD_OUT_LOW);
+    rdev->gpio = gpios;
+
+    return 0;
 }
 
 static int nrf24_probe(struct spi_device *spi)
 {
-    struct nrf24_radio *rdev;
-    int ret;
+    struct nrf24_dev *rdev;
+    int ret, node_id;
 
     printk(KERN_DEBUG "Request nrf24_radio creation. Device probe.\n");
     mutex_lock(&nrf24_module_lock);
@@ -478,48 +513,46 @@ static int nrf24_probe(struct spi_device *spi)
         return -ENOMEM;
 
     INIT_LIST_HEAD(&rdev->device);
+    spin_lock_init(&rdev->bus_lock);
+
     rdev->spi = spi;
-    rdev->devt = MKDEV(nrf24_major_num, nrf24_minor_count);
 
-    /* nRF24 gpio */
-    rdev->led_gpiod = gpiod_get_optional(&spi->dev, "led", GPIOD_OUT_LOW);
-    rdev->irq_gpiod = gpiod_get(&spi->dev, "interrupt", GPIOD_IN);
-    rdev->ce_gpiod  = gpiod_get(&spi->dev, "ce", GPIOD_OUT_LOW);
-
-    if (IS_ERR(rdev->ce_gpiod) || IS_ERR(rdev->irq_gpiod)) {
-        if (rdev->led_gpiod)
-            gpiod_put(rdev->led_gpiod);
-        if (!IS_ERR(rdev->ce_gpiod))
-            gpiod_put(rdev->ce_gpiod);
-        if (!IS_ERR(rdev->irq_gpiod))
-            gpiod_put(rdev->irq_gpiod);
-
-        kfree(rdev);
-        mutex_unlock(&nrf24_module_lock);
-        return -EINVAL;
-    }
-
-    if (IS_ERR(device_create(nrf24_class, &spi->dev, rdev->devt, rdev,
-                    "radio-%d", nrf24_minor_count++))) {
-        nrf24_gpio_unregister(rdev);
-        kfree(rdev);
-        mutex_unlock(&nrf24_module_lock);
-        return -ENODEV;
-    }
-
-    ret = nrf24_device_setup(rdev);
+    ret = nrf24_gpio_create(rdev);
     if (ret < 0) {
-        nrf24_gpio_unregister(rdev);
         kfree(rdev);
-        mutex_unlock(&nrf24_module_lock);
         return ret;
     }
 
-    list_add(&rdev->device, &nrf24_devices);
-    spi_set_drvdata(spi, rdev);
+    mutex_lock(&nrf24_module_lock);
+    node_id = find_first_zero_bit(nrf24_nodes, NRF24_MAX_NODES);
+    if (node_id < NRF24_MAX_NODES) {
+        struct device *dev;
+
+        dev = device_create(nrf24_class, &spi->dev, MKDEV(nrf24_major, rdev->node_id),
+                rdev, "radio-%d", rdev->node_id);
+
+        ret = PRT_ERR_OR_ZERO(dev);
+    }
+    else {
+        dev_warning(spi->dev, "no empty node available!\n");
+        ret = -ENODEV;
+    }
+
+    if (ret == 0) {
+        set_bit(nrf24_nodes, node_id);
+        list_add(&rdev->device, nrf24_devices);
+    }
     mutex_unlock(&nrf24_module_lock);
 
-    return 0;
+    if (ret == 0) {
+        spi_set_drvdata(spi, rdev);
+    }
+    else {
+        nrf24_gpio_destroy(rdev);
+        kfree(rdev);
+    }
+
+    return ret;
 }
 
 static int nrf24_remove(struct spi_device *spi)
@@ -555,7 +588,7 @@ MODULE_DEVICE_TABLE(of, nrf24_of_ids);
 
 static struct spi_driver nrf24_spi_driver = {
     .driver = {
-        .name = "nrf",
+        .name = "nrf24",
         .of_match_table = nrf24_of_ids,
     },
     .probe = nrf24_probe,
@@ -565,40 +598,37 @@ static struct spi_driver nrf24_spi_driver = {
 
 static int __init nrf24_init(void)
 {
-    int status;
+    int ret;
 
     printk(KERN_INFO "Initialize nRF24 module.\n");
 
-    status = register_chrdev(0, "nrf24", &nrf24_fops);
-    if (status < 0)
-        return status;
+    ret = register_chrdev(0, nrf24_spi_driver.driver.name, &nrf24_fops);
+    if (ret < 0)
+        return ret;
 
-    nrf24_major_num = status;
-
-    nrf24_class = class_create(THIS_MODULE, "nrf24radio");
+    nrf24_major = ret;
+    nrf24_class = class_create(THIS_MODULE, nrf24_spi_driver.driver.name);
     if (IS_ERR(nrf24_class)) {
-        printk(KERN_WARNING "Unable to register nRF24 radio class.\n");
-        unregister_chrdev(nrf24_major_num, "nrf24");
+        printk(KERN_WARNING "nrf24: unable to register device class.\n");
+        unregister_chrdev(nrf24_major, nrf24_spi_driver.driver.name);
         return -EINVAL;
     }
 
-    status = spi_register_driver(&nrf24_spi_driver);
-    if (status < 0) {
+    ret = spi_register_driver(&nrf24_spi_driver);
+    if (ret < 0) {
         printk(KERN_WARNING "Unable to register nRF24 SPI Driver.\n");
         class_destroy(nrf24_class);
-        unregister_chrdev(nrf24_major_num, "nrf24");
+        unregister_chrdev(nrf24_major, nrf24_spi_driver.driver.name);
     }
-
-    return status;
+    return ret;
 }
 
 static void __exit nrf24_exit(void)
 {
     printk(KERN_INFO "Unloading module.. Bye.\n");
-
     spi_unregister_driver(&nrf24_spi_driver);
     class_destroy(nrf24_class);
-    unregister_chrdev(nrf24_major_num, "nrf24");
+    unregister_chrdev(nrf24_major, nrf24_spi_driver.driver.name);
 }
 
 module_init(nrf24_init);
