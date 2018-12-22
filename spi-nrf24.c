@@ -517,12 +517,6 @@ static int nrf24_probe(struct spi_device *spi)
 
     rdev->spi = spi;
 
-    ret = nrf24_gpio_create(rdev);
-    if (ret < 0) {
-        kfree(rdev);
-        return ret;
-    }
-
     mutex_lock(&nrf24_module_lock);
     node_id = find_first_zero_bit(nrf24_nodes, NRF24_MAX_NODES);
     if (node_id < NRF24_MAX_NODES) {
@@ -539,45 +533,50 @@ static int nrf24_probe(struct spi_device *spi)
     }
 
     if (ret == 0) {
-        set_bit(nrf24_nodes, node_id);
+        set_bit(node_id, nrf24_nodes);
         list_add(&rdev->device, nrf24_devices);
     }
     mutex_unlock(&nrf24_module_lock);
 
-    if (ret == 0) {
-        spi_set_drvdata(spi, rdev);
-    }
-    else {
-        nrf24_gpio_destroy(rdev);
+    if (!ret)
+        ret = nrf24_gpio_create(rdev);
+
+    if (ret < 0) {
         kfree(rdev);
+        return ret;
     }
 
-    return ret;
+    spi_set_drvdata(spi, rdev);
+    return 0;
 }
 
 static int nrf24_remove(struct spi_device *spi)
 {
-    struct nrf24_radio *rdev = spi_get_drvdata(spi);
+    struct nrf24_radio *rdev;
 
-    printk(KERN_WARNING "Destroy nrf24_radio structure. Device remove.\n");
+    dev_warning(spi->dev, "remove device.\n");
+    rdev = spi_get_drvdata(spi);
 
-    if (rdev->led_gpiod)
-        gpiod_put(rdev->led_gpiod);
-    gpiod_put(rdev->irq_gpiod);
-    gpiod_put(rdev->ce_gpiod);
-
+    spin_lock_irq(&rdev->bus_lock);
     rdev->spi = NULL;
+    nrf24_gpio_destroy(rdev);
+    spin_unlock_irq(&rdev->bus_lock);
 
+    mutex_lock(&nrf24_module_lock);
+    device_destroy(nrf24_class, MKDEV(nrf24_major, rdev->node_id));
+
+    clear_bit(rdev->node_id, nrf24_nodes);
     list_del(&rdev->device);
-    device_destroy(nrf24_class, rdev->devt);
+
     kfree(rdev);
+    mutex_unlock(&nrf24_module_lock);
 
     return 0;
 }
 
 static void nrf24_shutdown(struct spi_device *spi)
 {
-    printk(KERN_WARNING "Shutdown device called.\n");
+    dev_warning(spi->dev, "shutdown mode called.\n");
 }
 
 static const struct of_device_id nrf24_of_ids[] = {
