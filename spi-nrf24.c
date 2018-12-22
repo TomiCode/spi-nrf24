@@ -45,6 +45,8 @@
 #define NRF24_RX_PW_P0      0x11
 #define NRF24_RX_PW_P1      0x12
 #define NRF24_FIFO_STATUS   0x17
+#define NRF24_DYNPD         0x1C
+#define NRF24_FEATURE       0x1D
 
 /*
  * Config register bits.
@@ -123,7 +125,7 @@ struct nrf24_radio {
 
 static DEFINE_MUTEX(nrf24_module_lock);
 
-static DECLARE_BITMAP(nrf24_nodes);
+static DECLARE_BITMAP(nrf24_nodes, NRF24_MAX_NODES);
 static LIST_HEAD(nrf24_devices);
 
 static struct class *nrf24_class;
@@ -135,30 +137,30 @@ static void nrf24_register_dump(struct spi_device *spi)
     uint8_t addr[5] = {0};
     uint8_t s_ch1, s_ch2;
 
-    config = spi_w8r8(spi, NRF24_REG_CONFIG);
-    status = spi_w8r8(spi, NRF24_REG_STATUS);
+    config = spi_w8r8(spi, NRF24_CONFIG);
+    status = spi_w8r8(spi, NRF24_STATUS);
     printk(KERN_DEBUG "nRF24 registers\nCONFIG: %02x, STATUS: %02x\n",
         config, status);
 
-    status = spi_w8r8(spi, NRF24_REG_RF_CH);
-    config = spi_w8r8(spi, NRF24_REG_RF_SETUP);
+    status = spi_w8r8(spi, NRF24_RF_CH);
+    config = spi_w8r8(spi, NRF24_RF_SETUP);
     printk(KERN_DEBUG "RF_SETUP: %02x, RF_CH: %02x\n", config, status);
 
-    s_ch1 = spi_w8r8(spi, NRF24_REG_RX_PW_P0);
-    s_ch2 = spi_w8r8(spi, NRF24_REG_RX_PW_P1);
+    s_ch1 = spi_w8r8(spi, NRF24_RX_PW_P0);
+    s_ch2 = spi_w8r8(spi, NRF24_RX_PW_P1);
     printk(KERN_DEBUG "RX_PW_P0: %02x, RX_PW_P1: %02x\n", s_ch1, s_ch2);
 
-    config = NRF24_REG_RX_ADDR_P0;
+    config = NRF24_RX_ADDR_P0;
     spi_write_then_read(spi, &config, 1, addr, 5);
     printk(KERN_DEBUG "RX_ADDR_P0: %02x %02x %02x %02x %02x", addr[0],
         addr[1], addr[2], addr[3], addr[4]);
 
-    config = NRF24_REG_RX_ADDR_P1;
+    config = NRF24_RX_ADDR_P1;
     spi_write_then_read(spi, &config, 1, addr, 5);
     printk(KERN_DEBUG "RX_ADDR_P1: %02x %02x %02x %02x %02x", addr[0],
         addr[1], addr[2], addr[3], addr[4]);
 
-    config = NRF24_REG_TX_ADDR;
+    config = NRF24_TX_ADDR;
     spi_write_then_read(spi, &config, 1, addr, 5);
     printk(KERN_DEBUG "TX_ADDR: %02x %02x %02x %02x %02x", addr[0],
         addr[1], addr[2], addr[3], addr[4]);
@@ -226,9 +228,9 @@ static ssize_t nrf24_read(struct file *file, char __user *buf, size_t count, lof
 static ssize_t nrf24_write(struct file *file, const char __user *buf, size_t count,
         loff_t *offset)
 {
-    struct nrf24_radio *rdev = file->private_data;
+    struct nrf24_dev *rdev = file->private_data;
+    uint8_t r_config, r_status;
     int ret, restore_rx;
-    int r_config, r_status;
 
     printk(KERN_DEBUG "Write to nrf24 device, count: %d, offset: %lld.\n",
             count, *offset);
@@ -237,7 +239,7 @@ static ssize_t nrf24_write(struct file *file, const char __user *buf, size_t cou
         return -EINVAL;
 
     ret = nrf24_read_reg(rdev, NRF24_CONFIG, &r_config);
-    if (!ret && test_bit(0, &r_config)) {
+    if (!ret && r_config & 0x01) {
         gpiod_set_value(rdev->gpio->ce, 0);
         ret = nrf24_write_reg(rdev, NRF24_CONFIG, r_config & ~NRF24_PRIM_RX);
 
@@ -252,7 +254,7 @@ static ssize_t nrf24_write(struct file *file, const char __user *buf, size_t cou
     if (ret < 0)
         return ret;
 
-    if (test_bit(0, &r_status))
+    if (r_status & 0x01)
         return -ENOSPC;
 
     memset(rdev->buf, 0, sizeof(*rdev->buf));
@@ -290,6 +292,7 @@ static long nrf24_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 static int nrf24_open(struct inode *inode, struct file *file)
 {
     struct nrf24_dev *rdev;
+    uint8_t r_config;
     int ret = -ENXIO;
 
     printk(KERN_DEBUG "nrf24: device open.\n");
@@ -302,7 +305,7 @@ static int nrf24_open(struct inode *inode, struct file *file)
         }
     }
 
-    if (ret == 0 && test_bit(0, &rdev->attrs))
+    if (ret == 0 && rdev->attrs & 0x01)
         ret = -EBUSY;
 
     if (ret < 0) {
@@ -326,7 +329,7 @@ static int nrf24_open(struct inode *inode, struct file *file)
         return ret;
     }
 
-    set_bit(0, &rdev->attrs);
+    rdev->attrs |= 0x01;
     file->private_data = rdev;
 
     nonseekable_open(inode, file);
@@ -337,13 +340,13 @@ static int nrf24_open(struct inode *inode, struct file *file)
 
 static int nrf24_release(struct inode *inode, struct file *file)
 {
-    struct nrf24_radio *rdev;
+    struct nrf24_dev *rdev;
 
     printk(KERN_DEBUG "Release a nrf24 device.\n");
     mutex_lock(&nrf24_module_lock);
 
     rdev = file->private_data;
-    if (!test_bit(0, &rdev->attrs)) {
+    if ((rdev->attrs & 0x01) == 0) {
         mutex_unlock(&nrf24_module_lock);
         printk(KERN_WARNING "nrf24: release a unbound device node.");
         return -EINVAL;
@@ -354,7 +357,7 @@ static int nrf24_release(struct inode *inode, struct file *file)
         rdev->buf = NULL;
     }
 
-    clear_bit(0, &rdev->attrs);
+    rdev->attrs &= ~0x01;
     mutex_unlock(&nrf24_module_lock);
     return 0;
 }
@@ -370,7 +373,6 @@ static const struct file_operations nrf24_fops = {
 
 static int nrf24_spi_device_reset(struct nrf24_dev *rdev)
 {
-    uint8_t r_config;
     int ret;
 
     gpiod_set_value(rdev->gpio->ce, 0);
@@ -409,7 +411,7 @@ static int nrf24_spi_device_reset(struct nrf24_dev *rdev)
     if (ret < 0)
         return ret;
 
-    return rf24_cmd(rdev, NRF24_FLUSH_RX);
+    return nrf24_cmd(rdev, NRF24_FLUSH_RX);
 }
 
 static int nrf24_gpio_create(struct nrf24_dev *rdev)
@@ -478,16 +480,16 @@ static int nrf24_probe(struct spi_device *spi)
         dev = device_create(nrf24_class, &spi->dev, MKDEV(nrf24_major, rdev->node_id),
                 rdev, "radio-%d", rdev->node_id);
 
-        ret = PRT_ERR_OR_ZERO(dev);
+        ret = PTR_ERR_OR_ZERO(dev);
     }
     else {
-        dev_warning(spi->dev, "no empty node available!\n");
+        dev_warn(&spi->dev, "no empty node available!\n");
         ret = -ENODEV;
     }
 
     if (ret == 0) {
         set_bit(node_id, nrf24_nodes);
-        list_add(&rdev->device, nrf24_devices);
+        list_add(&rdev->device, &nrf24_devices);
     }
     mutex_unlock(&nrf24_module_lock);
 
@@ -505,10 +507,10 @@ static int nrf24_probe(struct spi_device *spi)
 
 static int nrf24_remove(struct spi_device *spi)
 {
-    struct nrf24_radio *rdev;
+    struct nrf24_dev *rdev;
     int ret;
 
-    dev_warning(spi->dev, "remove device.\n");
+    dev_warn(&spi->dev, "remove device.\n");
     rdev = spi_get_drvdata(spi);
 
     ret = nrf24_spi_device_reset(rdev);
@@ -534,7 +536,7 @@ static int nrf24_remove(struct spi_device *spi)
 
 static void nrf24_shutdown(struct spi_device *spi)
 {
-    dev_warning(spi->dev, "shutdown mode called.\n");
+    dev_warn(&spi->dev, "shutdown mode called.\n");
 }
 
 static const struct of_device_id nrf24_of_ids[] = {
