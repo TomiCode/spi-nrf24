@@ -460,9 +460,7 @@ static int nrf24_probe(struct spi_device *spi)
     struct nrf24_dev *rdev;
     int ret, node_id;
 
-    printk(KERN_DEBUG "Request nrf24_radio creation. Device probe.\n");
-    mutex_lock(&nrf24_module_lock);
-
+    dev_info(&spi->dev, "device probe.\n");
     rdev = kzalloc(sizeof(*rdev), GFP_KERNEL);
     if (!rdev)
         return -ENOMEM;
