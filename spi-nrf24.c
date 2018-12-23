@@ -61,6 +61,13 @@
 #define NRF24_MASK_RX_DR    BIT(6)
 
 /*
+ * Status register important bits.
+ */
+#define NRF24_MAX_RT    BIT(4)
+#define NRF24_TX_DS     BIT(5)
+#define NRF24_RX_DR     BIT(6)
+
+/*
  * SPI Commands.
  */
 #define NRF24_R_RX_PAYLOAD  0x61
@@ -104,28 +111,8 @@ struct nrf24_dev {
     struct nrf24_dev_buf *buf;
 };
 
-/*
-struct nrf24_radio {
-    dev_t devt;
-    uint8_t in_use;
-
-    uint8_t config;
-    uint8_t status;
-    uint8_t fifo_status;
-
-    struct spi_device *spi;
-
-    struct list_head device;
-
-    struct gpio_desc *irq_gpiod;
-    struct gpio_desc *ce_gpiod;
-    struct gpio_desc *led_gpiod;
-
-    struct nrf24_radio_buffer *buf;
-};
-*/
-
 static DEFINE_MUTEX(nrf24_module_lock);
+static DECLARE_WAIT_QUEUE_HEAD(nrf24_event_queue);
 
 static DECLARE_BITMAP(nrf24_nodes, NRF24_MAX_NODES);
 static LIST_HEAD(nrf24_devices);
@@ -210,6 +197,29 @@ static int nrf24_write_then_read_reg(struct nrf24_dev *rdev, uint8_t addr, uint8
     return spi_sync_transfer(rdev->spi, t, 2);
 }
 
+static int nrf24_test_bit_reg(struct nrf24_dev *rdev, uint8_t addr, uint8_t bits, uint8_t *reg)
+{
+    uint8_t r_value;
+    int ret;
+
+    struct spi_transfer t[2] = {
+        { .tx_buf = &addr,      .len = sizeof(uint8_t) },
+        { .rx_buf = &r_value,   .len = sizeof(uint8_t) },
+    };
+
+    ret = spi_sync_transfer(rdev->spi, t, 2);
+    if (ret < 0)
+        return 0;
+
+    if (reg)
+        *reg = r_value;
+
+    if (r_value & bit)
+        return 1;
+
+    return 0;
+}
+
 static int nrf24_cmd(struct nrf24_dev *rdev, uint8_t cmd)
 {
     struct spi_transfer t = {
@@ -274,11 +284,20 @@ static ssize_t nrf24_write(struct file *file, const char __user *buf, size_t cou
     udelay(11);
     gpiod_set_value(rdev->gpio->ce, 0);
 
+    wait_event_interruptible(&nrf24_event_queue,
+            nrf24_test_bit_reg(rdev, NRF24_STATUS, NRF24_MAX_RT | NRF24_TX_DS, &r_status));
+
+    nrf24_write_reg(rdev, NRF24_STATUS, 0x70);
+
     if (restore_rx) {
         nrf24_read_reg(rdev, NRF24_CONFIG, &r_config);
         nrf24_write_reg(rdev, NRF24_CONFIG, r_config | NRF24_PRIM_RX);
         gpiod_set_value(rdev->gpio->ce, 1);
     }
+
+    if (r_status & NRF24_MAX_RT)
+        return -ECOMM;
+
     return count;
 }
 
@@ -294,6 +313,8 @@ static long nrf24_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 static irqreturn_t nrf24_irq_handler(int irq, void *dev_id)
 {
     printk(KERN_INFO "nrf24: interrupt occurred.\n");
+    wake_up_interruptible(&nrf24_event_queue);
+
     return IRQ_HANDLED;
 }
 
