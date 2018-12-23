@@ -95,6 +95,7 @@ struct nrf24_dev {
     uint8_t attrs;
     uint8_t node_id;
     spinlock_t bus_lock;
+    unsigned int irq;
 
     struct spi_device *spi;
     struct list_head device;
@@ -221,8 +222,9 @@ static int nrf24_cmd(struct nrf24_dev *rdev, uint8_t cmd)
 
 static ssize_t nrf24_read(struct file *file, char __user *buf, size_t count, loff_t *offset)
 {
-    struct nrf24_radio *rdev = file->private_data;
+    struct nrf24_dev *rdev = file->private_data;
     (void)rdev;
+    nrf24_register_dump(rdev->spi);
     return 0;
 }
 
@@ -232,6 +234,8 @@ static ssize_t nrf24_write(struct file *file, const char __user *buf, size_t cou
     struct nrf24_dev *rdev = file->private_data;
     uint8_t r_config, r_status;
     int ret, restore_rx;
+
+    nrf24_register_dump(rdev->spi);
 
     printk(KERN_DEBUG "Write to nrf24 device, count: %d, offset: %lld.\n",
             count, *offset);
@@ -267,17 +271,14 @@ static ssize_t nrf24_write(struct file *file, const char __user *buf, size_t cou
         return ret;
 
     gpiod_set_value(rdev->gpio->ce, 1);
-    udelay(12);
+    udelay(11);
     gpiod_set_value(rdev->gpio->ce, 0);
 
     if (restore_rx) {
-        udelay(130);
         nrf24_read_reg(rdev, NRF24_CONFIG, &r_config);
         nrf24_write_reg(rdev, NRF24_CONFIG, r_config | NRF24_PRIM_RX);
         gpiod_set_value(rdev->gpio->ce, 1);
     }
-
-    nrf24_register_dump(rdev->spi);
     return count;
 }
 
@@ -290,7 +291,7 @@ static long nrf24_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
     return 0;
 }
 
-static irqreturn_t nrf24_irq_handler(int irq,void *dev_id)
+static irqreturn_t nrf24_irq_handler(int irq, void *dev_id)
 {
     printk(KERN_INFO "nrf24: interrupt occurred.\n");
     return IRQ_HANDLED;
@@ -329,6 +330,9 @@ static int nrf24_open(struct inode *inode, struct file *file)
     ret = nrf24_read_reg(rdev, NRF24_CONFIG, &r_config);
     if (!ret)
         ret = nrf24_write_reg(rdev, NRF24_CONFIG, r_config | NRF24_PWR_UP);
+
+    if (!ret)
+        schedule_timeout_interruptible(msecs_to_jiffies(3));
 
     if (ret < 0) {
         kfree(rdev->buf);
@@ -411,6 +415,10 @@ static int nrf24_spi_device_reset(struct nrf24_dev *rdev)
         return ret;
 
     ret = nrf24_write_reg(rdev, NRF24_RF_CH, 0x34);
+    if (ret < 0)
+        return ret;
+
+    ret = nrf24_write_reg(rdev, NRF24_RX_PW_P0, 0x20);
     if (ret < 0)
         return ret;
 
@@ -507,14 +515,17 @@ static int nrf24_probe(struct spi_device *spi)
     }
 
     ret = gpiod_to_irq(rdev->gpio->irq);
+    printk(KERN_INFO "gpiod_to_irq result: %x\n", ret);
     if (ret < 0) {
-        printk(KERN_WARNING "nrf24: unable to get irq number. (%p)\n", ret);
+        printk(KERN_WARNING "nrf24: unable to get irq number. (%x)\n", ret);
     }
     else {
         rdev->irq = ret;
-        ret = request_irq(rdev->irq, nrf24_irq_handler, NULL, "nrf24_irq", rdev);
+        ret = request_irq(rdev->irq, nrf24_irq_handler,
+                IRQF_TRIGGER_FALLING, "nrf24_irq", rdev);
+
         if (ret < 0) {
-            printk(KERN_WARNING "nrf24: unable to request irq number. (%p)\n", ret);
+            printk(KERN_WARNING "nrf24: unable to request irq number. (%x)\n", ret);
             rdev->irq = 0;
         }
     }
