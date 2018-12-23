@@ -230,11 +230,72 @@ static int nrf24_cmd(struct nrf24_dev *rdev, uint8_t cmd)
     return spi_sync_transfer(rdev->spi, &t, 1);
 }
 
+static int nrf24_flush(struct file *file)
+{
+    struct nrf24_dev *rdev = file->private_data;
+    int ret;
+
+    ret = nrf24_cmd(rdev, NRF24_FLUSH_TX);
+    if (ret < 0)
+        return ret;
+
+    return nrf24_cmd(rdev, NRF24_FLUSH_RX);
+}
+
 static ssize_t nrf24_read(struct file *file, char __user *buf, size_t count, loff_t *offset)
 {
     struct nrf24_dev *rdev = file->private_data;
-    (void)rdev;
-    nrf24_register_dump(rdev->spi);
+    uint8_t r_config, r_status;
+    int ret;
+
+    printk(KERN_DEBUG "nrf24: read data from device %d, offset: %lld.\n", count, *offset);
+    if (*offset)
+        return -EINVAL;
+
+    ret = nrf24_read_reg(rdev, NRF24_CONFIG, &r_config);
+    if (ret < 0)
+        return ret;
+
+    if (r_config & NRF24_PRIM_RX) {
+        printk(KERN_WARNING "nrf24: device already in rx mode.\n");
+        return -EIO;
+    }
+
+    ret = nrf24_write_reg(rdev, NRF24_CONFIG, r_config | NRF24_PRIM_RX);
+    if (ret < 0)
+        return ret;
+
+    gpiod_set_value(rdev->gpio->ce, 1);
+    udelay(130);
+
+    ret = nrf24_read_reg(rdev, NRF24_STATUS, &r_status);
+    if (ret < 0)
+        return ret;
+
+    if ((r_status & NRF24_RX_DR) == 0) {
+        wait_event_interruptible(nrf24_event_queue,
+                nrf24_test_bit_reg(rdev, NRF24_STATUS, NRF24_RX_DR, &r_status));
+
+        if (r_status & NRF24_RX_DR)
+            nrf24_write_reg(rdev, NRF24_STATUS, NRF24_RX_DR);
+    }
+
+    gpiod_set_value(rdev->gpio->ce, 0);
+    if (r_status & NRF24_RX_DR) {
+        memset(rdev->buf, 0, sizeof(*rdev->buf));
+
+        struct spi_transfer t[2] = {
+            { .tx_buf = &rdev->buf->cmd, .len = sizeof(uint8_t) },
+            { .rx_buf = rdev->buf->msg, .len = sizeof(rdev->buf->msg) }
+        };
+
+        ret = spi_sync_transfer(rdev->spi, t, 2);
+    }
+    else
+        return -ENODATA;
+
+    copy_to_user(rdev->buf->cmd, buf, min(NRF24_BUFFER_SIZE, count));
+
     return 0;
 }
 
@@ -289,6 +350,9 @@ static ssize_t nrf24_write(struct file *file, const char __user *buf, size_t cou
 
     nrf24_write_reg(rdev, NRF24_STATUS, 0x70);
 
+    if (r_status & NRF24_MAX_RT)
+        nrf24_cmd(rdev, NRF24_FLUSH_TX);
+
     if (restore_rx) {
         nrf24_read_reg(rdev, NRF24_CONFIG, &r_config);
         nrf24_write_reg(rdev, NRF24_CONFIG, r_config | NRF24_PRIM_RX);
@@ -296,7 +360,7 @@ static ssize_t nrf24_write(struct file *file, const char __user *buf, size_t cou
     }
 
     if (r_status & NRF24_MAX_RT)
-        return -ECOMM;
+        return -EIO;
 
     return count;
 }
@@ -398,6 +462,7 @@ static const struct file_operations nrf24_fops = {
     .owner          = THIS_MODULE,
     .read           = nrf24_read,
     .write          = nrf24_write,
+    .flush          = nrf24_flush,
     .open           = nrf24_open,
     .release        = nrf24_release,
     .unlocked_ioctl = nrf24_ioctl,
