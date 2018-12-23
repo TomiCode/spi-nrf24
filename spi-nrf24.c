@@ -15,6 +15,7 @@
  */
 
 #include <linux/init.h>
+#include <linux/wait.h>
 #include <linux/delay.h>
 #include <linux/module.h>
 #include <linux/device.h>
@@ -214,7 +215,7 @@ static int nrf24_test_bit_reg(struct nrf24_dev *rdev, uint8_t addr, uint8_t bits
     if (reg)
         *reg = r_value;
 
-    if (r_value & bit)
+    if (r_value & bits)
         return 1;
 
     return 0;
@@ -284,10 +285,13 @@ static ssize_t nrf24_write(struct file *file, const char __user *buf, size_t cou
     udelay(11);
     gpiod_set_value(rdev->gpio->ce, 0);
 
-    wait_event_interruptible(&nrf24_event_queue,
+    wait_event_interruptible(nrf24_event_queue,
             nrf24_test_bit_reg(rdev, NRF24_STATUS, NRF24_MAX_RT | NRF24_TX_DS, &r_status));
 
     nrf24_write_reg(rdev, NRF24_STATUS, 0x70);
+
+    if (r_status & NRF24_MAX_RT)
+        nrf24_cmd(rdev, NRF24_FLUSH_TX);
 
     if (restore_rx) {
         nrf24_read_reg(rdev, NRF24_CONFIG, &r_config);
@@ -296,7 +300,7 @@ static ssize_t nrf24_write(struct file *file, const char __user *buf, size_t cou
     }
 
     if (r_status & NRF24_MAX_RT)
-        return -ECOMM;
+        return -EIO;
 
     return count;
 }
