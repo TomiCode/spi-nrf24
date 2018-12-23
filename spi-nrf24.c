@@ -20,6 +20,7 @@
 #include <linux/device.h>
 #include <linux/kernel.h>
 #include <linux/uaccess.h>
+#include <linux/interrupt.h>
 #include <linux/spi/spi.h>
 #include <linux/gpio/consumer.h>
 
@@ -289,6 +290,12 @@ static long nrf24_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
     return 0;
 }
 
+static irqreturn_t nrf24_irq_handler(int irq,void *dev_id)
+{
+    printk(KERN_INFO "nrf24: interrupt occurred.\n");
+    return IRQ_HANDLED;
+}
+
 static int nrf24_open(struct inode *inode, struct file *file)
 {
     struct nrf24_dev *rdev;
@@ -499,6 +506,19 @@ static int nrf24_probe(struct spi_device *spi)
         return ret;
     }
 
+    ret = gpiod_to_irq(rdev->gpio->irq);
+    if (ret < 0) {
+        printk(KERN_WARNING "nrf24: unable to get irq number. (%p)\n", ret);
+    }
+    else {
+        rdev->irq = ret;
+        ret = request_irq(rdev->irq, nrf24_irq_handler, NULL, "nrf24_irq", rdev);
+        if (ret < 0) {
+            printk(KERN_WARNING "nrf24: unable to request irq number. (%p)\n", ret);
+            rdev->irq = 0;
+        }
+    }
+
     spi_set_drvdata(spi, rdev);
     return nrf24_spi_device_reset(rdev);
 }
@@ -522,6 +542,9 @@ static int nrf24_remove(struct spi_device *spi)
 
     mutex_lock(&nrf24_module_lock);
     device_destroy(nrf24_class, MKDEV(nrf24_major, rdev->node_id));
+
+    if (rdev->irq > 0)
+        free_irq(rdev->irq, rdev);
 
     clear_bit(rdev->node_id, nrf24_nodes);
     list_del(&rdev->device);
