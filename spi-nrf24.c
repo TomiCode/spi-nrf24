@@ -82,6 +82,17 @@
 #define NRF24_MAX_NODES 8
 
 /*
+ * Device ioctl commands.
+ */
+#define NRF24_IOC_SET_ADDR 0x01
+#define NRF24_IOC_SET_RFCH 0x02
+
+struct nrf24_ioctl_address {
+    uint8_t type;
+    uint8_t bytes[5];
+};
+
+/*
  * Device driver internal rx/tx buffer with the related command.
  */
 struct nrf24_dev_buf {
@@ -368,8 +379,29 @@ static ssize_t nrf24_write(struct file *file, const char __user *buf, size_t cou
 static long nrf24_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 {
     struct nrf24_dev *rdev = file->private_data;
-    (void)rdev;
+    struct nrf24_ioctl_address addr;
+    u8 r_reg;
+    int ret, value;
+
     printk(KERN_DEBUG "nrf24: ioctl command: %u, arg: %02lx.\n", cmd, arg);
+
+    switch(cmd) {
+    case NRF24_IOC_SET_ADDR:
+        ret = copy_from_user(&addr, (void __user *)arg, sizeof(addr));
+        if (ret == 0) {
+            addr.type = (addr.type == 0) ? NRF24_TX_ADDR : NRF24_RX_ADDR_P1;
+            addr.type |= 0x20;
+
+            ret = spi_write(rdev->spi, &addr, sizeof(addr));
+        }
+        break;
+    case NRF24_IOC_SET_RFCH:
+        ret = get_user(r_reg, (__u8 __user *)arg);
+        if (ret == 0)
+            ret = nrf24_write_reg(rdev->spi, NRF24_RF_CH, r_reg);
+
+        break;
+    }
 
     return 0;
 }
