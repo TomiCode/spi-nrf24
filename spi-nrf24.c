@@ -79,7 +79,7 @@
 /*
  * Device driver constraints.
  */
-#define NRF24_BUFFER_SIZE 32
+#define NRF24_BUFFER_SIZE 32U
 #define NRF24_MAX_NODES 8
 
 /*
@@ -242,7 +242,7 @@ static int nrf24_cmd(struct nrf24_dev *rdev, uint8_t cmd)
     return spi_sync_transfer(rdev->spi, &t, 1);
 }
 
-static int nrf24_flush(struct file *file)
+static int nrf24_flush(struct file *file, fl_owner_t id)
 {
     struct nrf24_dev *rdev = file->private_data;
     int ret;
@@ -257,7 +257,7 @@ static int nrf24_flush(struct file *file)
 static ssize_t nrf24_read(struct file *file, char __user *buf, size_t count, loff_t *offset)
 {
     struct nrf24_dev *rdev = file->private_data;
-    uint8_t r_config, r_status;
+    uint8_t r_config, r_status, r_fifo;
     int ret;
 
     printk(KERN_DEBUG "nrf24: read data from device %d, offset: %lld.\n", count, *offset);
@@ -277,6 +277,13 @@ static ssize_t nrf24_read(struct file *file, char __user *buf, size_t count, lof
     if (ret < 0)
         return ret;
 
+    ret = nrf24_read_reg(rdev, NRF24_FIFO_STATUS, &r_fifo);
+    if (ret < 0)
+        return ret;
+
+    if (r_fifo & 0x01)
+        nrf24_cmd(rdev, NRF24_FLUSH_RX);
+
     gpiod_set_value(rdev->gpio->ce, 1);
     udelay(130);
 
@@ -285,30 +292,43 @@ static ssize_t nrf24_read(struct file *file, char __user *buf, size_t count, lof
         return ret;
 
     if ((r_status & NRF24_RX_DR) == 0) {
-        wait_event_interruptible(nrf24_event_queue,
+        ret = wait_event_interruptible(nrf24_event_queue,
                 nrf24_test_bit_reg(rdev, NRF24_STATUS, NRF24_RX_DR, &r_status));
 
         if (r_status & NRF24_RX_DR)
             nrf24_write_reg(rdev, NRF24_STATUS, NRF24_RX_DR);
     }
 
-    gpiod_set_value(rdev->gpio->ce, 0);
-    if (r_status & NRF24_RX_DR) {
-        memset(rdev->buf, 0, sizeof(*rdev->buf));
+    if (ret == -ERESTARTSYS) {
+        dev_info(&rdev->spi->dev, "read interrupted.\n");
+        r_status = 0;
+    }
 
+    gpiod_set_value(rdev->gpio->ce, 0);
+    nrf24_write_reg(rdev, NRF24_CONFIG, r_config);
+
+    if (r_status & NRF24_RX_DR) {
         struct spi_transfer t[2] = {
             { .tx_buf = &rdev->buf->cmd, .len = sizeof(uint8_t) },
             { .rx_buf = rdev->buf->msg, .len = sizeof(rdev->buf->msg) }
         };
 
+        memset(rdev->buf, 0, sizeof(*rdev->buf));
+
+        rdev->buf->cmd = NRF24_R_RX_PAYLOAD;
         ret = spi_sync_transfer(rdev->spi, t, 2);
+
+        printk(KERN_INFO "sync_transfer: %d, %02x:%02x\n", ret,
+            rdev->buf->msg[0], rdev->buf->msg[1]);
     }
     else
         return -ENODATA;
 
-    copy_to_user(rdev->buf->cmd, buf, min(NRF24_BUFFER_SIZE, count));
 
-    return 0;
+    if (r_status)
+        copy_to_user(buf, rdev->buf->msg, min(NRF24_BUFFER_SIZE, count));
+
+    return min(NRF24_BUFFER_SIZE, count);
 }
 
 static ssize_t nrf24_write(struct file *file, const char __user *buf, size_t count,
@@ -316,7 +336,8 @@ static ssize_t nrf24_write(struct file *file, const char __user *buf, size_t cou
 {
     struct nrf24_dev *rdev = file->private_data;
     uint8_t r_config, r_status;
-    int ret, restore_rx;
+    int restore_rx = 0;
+    int ret;
 
     nrf24_register_dump(rdev->spi);
 
@@ -327,7 +348,7 @@ static ssize_t nrf24_write(struct file *file, const char __user *buf, size_t cou
         return -EINVAL;
 
     ret = nrf24_read_reg(rdev, NRF24_CONFIG, &r_config);
-    if (!ret && r_config & 0x01) {
+    if (!ret && r_config & NRF24_PRIM_RX) {
         gpiod_set_value(rdev->gpio->ce, 0);
         ret = nrf24_write_reg(rdev, NRF24_CONFIG, r_config & ~NRF24_PRIM_RX);
 
@@ -382,7 +403,7 @@ static long nrf24_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
     struct nrf24_dev *rdev = file->private_data;
     struct nrf24_ioctl_address addr;
     u8 r_reg;
-    int ret, value;
+    int ret;
 
     printk(KERN_DEBUG "nrf24: ioctl command: %u, arg: %02lx.\n", cmd, arg);
 
@@ -399,7 +420,7 @@ static long nrf24_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
     case NRF24_IOC_SET_RFCH:
         ret = get_user(r_reg, (__u8 __user *)arg);
         if (ret == 0)
-            ret = nrf24_write_reg(rdev->spi, NRF24_RF_CH, r_reg);
+            ret = nrf24_write_reg(rdev, NRF24_RF_CH, r_reg);
 
         break;
     }
@@ -541,6 +562,7 @@ static int nrf24_spi_device_reset(struct nrf24_dev *rdev)
     if (ret < 0)
         return ret;
 
+    ret = nrf24_write_reg(rdev, NRF24_RX_PW_P1, 0x20);
     ret = nrf24_cmd(rdev, NRF24_FLUSH_TX);
     if (ret < 0)
         return ret;
