@@ -88,11 +88,6 @@
 #define NRF24_IOC_SET_ADDR 0x01
 #define NRF24_IOC_SET_RFCH 0x02
 
-struct nrf24_ioctl_address {
-    uint8_t type;
-    uint8_t bytes[5];
-};
-
 /*
  * Device driver internal rx/tx buffer with the related command.
  */
@@ -281,7 +276,7 @@ static ssize_t nrf24_read(struct file *file, char __user *buf, size_t count, lof
     if (ret < 0)
         return ret;
 
-    if (r_fifo & 0x01)
+    if ((r_fifo & 0x01) == 0)
         nrf24_cmd(rdev, NRF24_FLUSH_RX);
 
     gpiod_set_value(rdev->gpio->ce, 1);
@@ -320,10 +315,11 @@ static ssize_t nrf24_read(struct file *file, char __user *buf, size_t count, lof
 
         printk(KERN_INFO "sync_transfer: %d, %02x:%02x\n", ret,
             rdev->buf->msg[0], rdev->buf->msg[1]);
+
+        nrf24_cmd(rdev, NRF24_FLUSH_RX);
     }
     else
         return -ENODATA;
-
 
     if (r_status)
         copy_to_user(buf, rdev->buf->msg, min(NRF24_BUFFER_SIZE, count));
@@ -401,20 +397,35 @@ static ssize_t nrf24_write(struct file *file, const char __user *buf, size_t cou
 static long nrf24_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 {
     struct nrf24_dev *rdev = file->private_data;
-    struct nrf24_ioctl_address addr;
     u8 r_reg;
+    u8 ce_state;
     int ret;
 
     printk(KERN_DEBUG "nrf24: ioctl command: %u, arg: %02lx.\n", cmd, arg);
 
+    ret = gpiod_get_value(rdev->gpio->ce);
+    if (ret < 0)
+        return ret;
+
+    ce_state = ret;
+
     switch(cmd) {
     case NRF24_IOC_SET_ADDR:
-        ret = copy_from_user(&addr, (void __user *)arg, sizeof(addr));
-        if (ret == 0) {
-            addr.type = (addr.type == 0) ? NRF24_TX_ADDR : NRF24_RX_ADDR_P1;
-            addr.type |= 0x20;
+        printk(KERN_INFO "set device tx address.\n");
+        ret = copy_from_user(rdev->buf->msg, (void __user *)arg, sizeof(uint8_t) * 5);
+        if (ret < 0) {
+            printk(KERN_INFO "Unable to copy user data.\n");
+            break;
+        }
 
-            ret = spi_write(rdev->spi, &addr, sizeof(addr));
+        printk(KERN_INFO "address %02x %02x\n", rdev->buf->msg[3],
+                rdev->buf->msg[4]);
+
+        rdev->buf->cmd = NRF24_TX_ADDR | 0x20;
+        ret = spi_write(rdev->spi, rdev->buf, sizeof(uint8_t) * 6);
+        if (ret == 0) {
+            rdev->buf->cmd = NRF24_RX_ADDR_P0 | 0x20;
+            ret = spi_write(rdev->spi, rdev->buf, sizeof(uint8_t) * 6);
         }
         break;
     case NRF24_IOC_SET_RFCH:
@@ -423,6 +434,11 @@ static long nrf24_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
             ret = nrf24_write_reg(rdev, NRF24_RF_CH, r_reg);
 
         break;
+    }
+
+    if (ce_state) {
+        gpiod_set_value(rdev->gpio->ce, 1);
+        udelay(130);
     }
 
     return 0;
